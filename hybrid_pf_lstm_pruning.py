@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 # Chaser–Evader POMDP (coins + decoy + egocentric actions)
-# Hybrid: Particle-Filter summary + GRU(DRQN)
-# 요구사항 반영:
-#  - POMDP 본질 유지: "진전 없음"은 조기 종료 대신 학습 시퀀스에서 **데이터 필터링**(프레임 스킵)으로 제외
-#  - 에피소드 스텝가드: 1000
-#  - 코인 중심 보상: evader per-step 생존보상 0, 수집/탐지 보상 상향
-#  - LOOK 보너스: PF 엔트로피 감소(정보이득) 있을 때만 외부 shaping으로 부여
-#  - 프루닝(pruning): 시각화용 정책그래프 사본에만 적용(학습/데이터에는 절대 적용 X)
-#  - Best-episode 기반 정책그래프 + Top-10% 합성 PNG 저장
+# Hybrid: Particle-Filter summary + DRQN (Dueling + GRU)
+# - No images. JSON only (for Unreal Engine parsing)
+# - Alternating self-play training (role by role)
+# - Action commit (durations) honored: some actions persist multiple ticks
+# - Curriculum test: after threshold, run 2v2 (40x40) evaluation with shared policies
+# - Save:
+#   * Every 1,000 episodes: phase log JSON (outputs/logs/)
+#   * End of each phase: applied overwrite JSON + .pt (outputs/applied/), snapshot .pt (outputs/snapshots/)
+#   * Top-10% (role-phase pool) meaningful episodes JSON (outputs/logs/)
 #
-# 참고:
-#  - Tabular Q 전면 제거; 함수근사 DRQN(Double+Dueling) 단일 파일
-#  - PyTorch >= 2.x 권장
-#  - SHOW_EVERY/PRINT_EVERY는 하단 main에서 쉽게 조정 가능
+# Safe defaults for speed:
+#  - PF particles = 300 (adjust via HybridConfig)
+#  - Greedy evaluation only when needed (reduced frequency)
+#
+# Tested with: Python 3.10+, PyTorch 2.x
 
 import os, time, json, math, random, threading, shutil
 from dataclasses import dataclass
@@ -20,101 +22,22 @@ from typing import Dict, Tuple, List, Optional
 from collections import Counter, defaultdict
 
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import networkx as nx
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ======================= FFMPEG AUTO-DETECT (PNG only) ===================== #
-ffmpeg_path = shutil.which("ffmpeg")
-if not ffmpeg_path:
-    common_candidates = [
-        r"C:\ffmpeg\bin\ffmpeg.exe",
-        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
-        r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
-        os.path.expanduser(r"~\Desktop\TUK\졸작\연구주제\ffmpeg-8.0-essentials_build\bin\ffmpeg.exe"),
-        os.path.expanduser(r"~\AppData\Local\Programs\ffmpeg\bin\ffmpeg.exe"),
-    ]
-    for p in common_candidates:
-        if os.path.exists(p):
-            ffmpeg_path = p
-            break
-if ffmpeg_path:
-    matplotlib.rcParams['animation.ffmpeg_path'] = ffmpeg_path
-    print(f"[ffmpeg] ✅ detected at: {ffmpeg_path}")
-else:
-    print("[ffmpeg] ⚠ not found. (No animation; PNG only)")
-
 # ============================ OUTPUT PATHS ================================= #
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "outputs")
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR  = os.path.join(SCRIPT_DIR, "outputs")
 APPLIED_DIR = os.path.join(OUTPUT_DIR, "applied")
-SNAPSHOT_DIR = os.path.join(OUTPUT_DIR, "snapshots")
-LOGS_DIR = os.path.join(OUTPUT_DIR, "logs")
-MEDIA_DIR = os.path.join(OUTPUT_DIR, "media")
+SNAP_DIR    = os.path.join(OUTPUT_DIR, "snapshots")
+LOGS_DIR    = os.path.join(OUTPUT_DIR, "logs")
 os.makedirs(APPLIED_DIR, exist_ok=True)
-os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+os.makedirs(SNAP_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
-os.makedirs(MEDIA_DIR, exist_ok=True)
 
-# =============================== CONFIG ==================================== #
-@dataclass
-class Config:
-    # World / observation
-    grid_size: int = 20
-    fov_radius: int = 10
-    obs_noise: float = 0.12
-    slip: float = 0.04
-    capture_radius: int = 0
-    seed: int = 42
-
-    # Reward shaping (환경 내부)
-    time_penalty: float = 0.0005
-    k_distance: float  = 0.005
-    k_los: float       = 0.002
-    k_info: float      = 0.0   # << LOOK/FOCUS 내부 보상은 0으로 두고, 외부 shaping에서 정보이득 시에만 부여
-
-    # Action costs
-    action_cost_wait: float     = 0.0
-    action_cost_rot: float      = 0.0003
-    action_cost_look: float     = 0.00035
-    action_cost_focus: float    = 0.00045
-    action_cost_strafe: float   = 0.00015
-    action_cost_back: float     = 0.00015
-    action_cost_spin: float     = 0.0003
-    action_cost_take_corner: float = 0.0005
-    action_cost_collect: float  = 0.0003
-    action_cost_decoy: float    = 0.0008
-
-    # Coin mission (코인 중심)
-    coin_count: int = 5
-    coin_collect_ticks: int = 5
-    r_collect_tick: float = 0.5     # ↑
-    r_collect_done: float = 2.0     # ↑
-    r_all_coins_bonus: float = 10.0 # ↑
-
-    # Coin-aware shaping
-    r_coin_detect: float = 0.08
-    k_coin_approach: float = 0.003
-    r_coin_visible: float = 0.015
-    r_duplicate_penalty: float = -0.05
-
-    # Threat-aware shaping
-    threat_radius: int = 3
-    k_threat_avoid: float = 0.003
-
-    # DECOY effect (Evader)
-    decoy_duration: int = 3
-    r_decoy_success: float = 0.5
-    decoy_slip_add: float = 0.08
-    decoy_noise_mult: float = 2.0
-
-random.seed(42); np.random.seed(42); torch.manual_seed(42)
-
+# =============================== UTIL ====================================== #
+def clamp(x, lo, hi): return max(lo, min(hi, x))
 def manhattan(a,b): return abs(a[0]-b[0]) + abs(a[1]-b[1])
 
 def angle_bin_from_dxdy16(dx, dy):
@@ -128,6 +51,81 @@ DIRS8 = [(1,0),(1,1),(0,1),(-1,1),(-1,0),(-1,-1),(0,-1),(1,-1)]
 def dir_to_vec(di): return DIRS8[di % 8]
 def add_pos(p, delta, n): return (max(0, min(n-1, p[0]+delta[0])), max(0, min(n-1, p[1]+delta[1])))
 
+# =============================== CONFIG ==================================== #
+@dataclass
+class Config:
+    # World / observation
+    grid_size: int = 20
+    fov_radius: int = 10
+    obs_noise: float = 0.12
+    slip: float = 0.04
+    capture_radius: int = 0
+    seed: int = 42
+
+    # Reward shaping
+    time_penalty: float = 0.0005
+    k_distance: float  = 0.005
+    k_los: float       = 0.002
+    k_info: float      = 0.0005
+
+    # Action costs
+    action_cost_rot: float      = 0.0003
+    action_cost_look: float     = 0.00035
+    action_cost_focus: float    = 0.00045
+    action_cost_strafe: float   = 0.00015
+    action_cost_back: float     = 0.00015
+    action_cost_spin: float     = 0.0003
+    action_cost_take_corner: float = 0.0005
+    action_cost_collect: float  = 0.0003
+    action_cost_decoy: float    = 0.0008
+
+    # Coin mission
+    coin_count: int = 5
+    coin_collect_ticks: int = 5
+    r_collect_tick: float = 0.2
+    r_collect_done: float = 1.0
+    r_all_coins_bonus: float = 5.0
+
+    # Coin-aware shaping
+    r_coin_detect: float = 0.05
+    k_coin_approach: float = 0.002
+    r_coin_visible: float = 0.01
+    r_duplicate_penalty: float = -0.05
+
+    # Threat-aware shaping
+    threat_radius: int = 3
+    k_threat_avoid: float = 0.003
+
+    # DECOY effect (Evader)
+    decoy_duration: int = 3
+    r_decoy_success: float = 0.5
+    decoy_slip_add: float = 0.08
+    decoy_noise_mult: float = 2.0
+
+    # Episode guard & early-stop
+    max_steps: int = 1000
+    no_progress_patience: int = 120   # steps without events -> early stop (train only)
+
+    # Action commit (durations, in ticks)
+    # (You can tune these for your presentation semantics)
+    action_commit: Dict[str,int] = None
+
+    def __post_init__(self):
+        if self.action_commit is None:
+            self.action_commit = {
+                "WAIT":1,
+                "ROT+1":1, "ROT-1":1, "ROT+2":1, "ROT-2":1,
+                "SPIN":1,
+                "FORWARD":1,
+                "STRAFE_L":1, "STRAFE_R":1,
+                "BACKSTEP":1,
+                "LOOK":1,             # LOOK effects already linger via look_bonus
+                "FOCUS":2,            # Presentation-wise: hold 2 ticks
+                "TAKE_CORNER":1,
+                "COLLECT":1,
+                "DECOY":1
+            }
+
 # =============================== ACTIONS =================================== #
 ACTIONS: List[Tuple[str, Tuple]] = [
     ("WAIT", ()),
@@ -137,20 +135,20 @@ ACTIONS: List[Tuple[str, Tuple]] = [
     ("STRAFE_L", ("L", 1)), ("STRAFE_R", ("R", 1)),
     ("BACKSTEP", (1,)),
     ("LOOK", ()),
-    ("FOCUS", ()),
+    ("FOCUS", ()),          # FOV/noise bonus handled in env + commit=2
     ("TAKE_CORNER", ()),
-    ("COLLECT", ()),    # Evader only
-    ("DECOY", ()),      # Evader only
+    ("COLLECT", ()),        # Evader only
+    ("DECOY", ()),          # Evader only
 ]
 NUM_ACTIONS = len(ACTIONS)
+assert NUM_ACTIONS == 15
 
-# =============================== ENV ======================================= #
+# =============================== ENV (1v1) ================================= #
 class TwoAgentTagEnv:
     def __init__(self, cfg: Config):
         self.cfg = cfg; self.n = cfg.grid_size
         self.look_bonus = {"chaser": 0, "evader": 0}
-        self.coins = set()
-        self.coin_ticks = {}
+        self.coins = set(); self.coin_ticks = {}
         self.evader_collected = 0
         self.coins_seen = set()
         self.decoy_timer = 0
@@ -165,7 +163,6 @@ class TwoAgentTagEnv:
         self.decoy_timer = 0
         self.evader_collected = 0
         self.coins_seen.clear()
-
         self.coins.clear(); self.coin_ticks.clear()
         forbid = {self.state[0], self.state[2]}
         while len(self.coins) < self.cfg.coin_count:
@@ -227,6 +224,7 @@ class TwoAgentTagEnv:
         (c, fc, e, fe) = self.state
         prev_d = manhattan(c, e)
 
+        # timers
         if self.look_bonus["chaser"] > 0: self.look_bonus["chaser"] -= 1
         if self.look_bonus["evader"] > 0: self.look_bonus["evader"] -= 1
         if self.decoy_timer > 0: self.decoy_timer -= 1
@@ -241,7 +239,7 @@ class TwoAgentTagEnv:
         c_next, fc_next = self._apply_action(c, fc, "chaser", a_c, e)
         e_next, fe_next = self._apply_action(e, fe, "evader", a_e, c)
 
-        # DECOY
+        # Decoy
         r_decoy = 0.0
         if ACTIONS[a_e][0] == "DECOY":
             d_now = manhattan(e_next, c_next)
@@ -249,7 +247,7 @@ class TwoAgentTagEnv:
                 self.decoy_timer = self.cfg.decoy_duration
                 r_decoy = self.cfg.r_decoy_success
 
-        # COIN
+        # Coin
         r_collect_tick = 0.0; r_collect_done = 0.0; dup_penalty = 0.0
         if ACTIONS[a_e][0] == "COLLECT":
             if e_next in self.coins:
@@ -270,9 +268,9 @@ class TwoAgentTagEnv:
 
         # Base rewards
         r_c = 1.0 if done_capture else 0.0
-        r_e = (-1.0 if done_capture else 0.0)   # evader 생존 보상 0
+        r_e = (-1.0 if done_capture else 0.01)
 
-        # Coin-aware shaping
+        # Coin shaping
         nearest_p, nearest_d_now = self._nearest_coin_dist(e_next)
         if nearest_p is not None and manhattan(e_next, nearest_p) <= self.cfg.fov_radius:
             if nearest_p not in self.coins_seen:
@@ -285,7 +283,7 @@ class TwoAgentTagEnv:
         r_e += r_collect_tick + r_collect_done + r_decoy + dup_penalty
         if done_allcoins: r_e += self.cfg.r_all_coins_bonus
 
-        # Generic shaping
+        # Generic shaping (distance/LOS/time)
         r_c -= self.cfg.time_penalty; r_e -= self.cfg.time_penalty
         new_d  = manhattan(c_next, e_next)
         delta_d = prev_d - new_d
@@ -296,29 +294,45 @@ class TwoAgentTagEnv:
         else:           r_e += self.cfg.k_los
 
         kind_c, _ = ACTIONS[a_c]; kind_e, _ = ACTIONS[a_e]
-        # LOOK/FOCUS 보너스는 외부 shaping으로만 (k_info=0.0)
+        if kind_c == "LOOK":   r_c += self.cfg.k_info
+        if kind_c == "FOCUS":  r_c += 0.75 * self.cfg.k_info
+        if kind_e == "LOOK":   r_e += self.cfg.k_info
+        if kind_e == "FOCUS":  r_e += 0.75 * self.cfg.k_info
+
+        threat = (new_d <= self.cfg.threat_radius)
+        if threat and kind_e not in ("COLLECT", "DECOY"):
+            r_e += self.cfg.k_threat_avoid
+        elif threat and kind_e == "COLLECT":
+            r_e -= self.cfg.k_threat_avoid
 
         def act_cost(kind: str) -> float:
-            if   kind == "WAIT":        return 0.0
-            elif kind.startswith("ROT"):return self.cfg.action_cost_rot
-            elif kind == "LOOK":        return self.cfg.action_cost_look
-            elif kind == "FOCUS":       return self.cfg.action_cost_focus
-            elif kind.startswith("STRAFE"):  return self.cfg.action_cost_strafe
-            elif kind == "BACKSTEP":    return self.cfg.action_cost_back
-            elif kind == "SPIN":        return self.cfg.action_cost_spin
-            elif kind == "TAKE_CORNER": return self.cfg.action_cost_take_corner
-            elif kind == "COLLECT":     return self.cfg.action_cost_collect
-            elif kind == "DECOY":       return self.cfg.action_cost_decoy
-            elif kind == "FORWARD":     return 0.0
-            else:                       return 0.0
+            if   kind.startswith("ROT"):  return self.cfg.action_cost_rot
+            elif kind == "LOOK":          return self.cfg.action_cost_look
+            elif kind == "FOCUS":         return self.cfg.action_cost_focus
+            elif kind.startswith("STRAFE"):return self.cfg.action_cost_strafe
+            elif kind == "BACKSTEP":      return self.cfg.action_cost_back
+            elif kind == "SPIN":          return self.cfg.action_cost_spin
+            elif kind == "TAKE_CORNER":   return self.cfg.action_cost_take_corner
+            elif kind == "COLLECT":       return self.cfg.action_cost_collect
+            elif kind == "DECOY":         return self.cfg.action_cost_decoy
+            elif kind == "FORWARD":       return 0.0
+            else:                         return 0.0
         r_c -= act_cost(kind_c); r_e -= act_cost(kind_e)
 
         if done_capture:
             r_c = 1.0; r_e = -1.0
 
-        return self.state, (r_c, r_e), done
+        # events (for early stop detection)
+        events = {
+            "capture": done_capture,
+            "coin_collected": (r_collect_done > 0.0),
+            "decoy": (ACTIONS[a_e][0] == "DECOY" and r_decoy > 0.0),
+            "distance_change": (delta_d != 0),
+        }
 
-    # -------------------- Observation (POMDP) -------------------- #
+        return self.state, (r_c, r_e), done, events
+
+    # Observation (POMDP)
     def _dist_bin(self, d, cuts=(1,2,4,6,9,13,18,24)):
         for i,c in enumerate(cuts):
             if d <= c: return i
@@ -387,17 +401,15 @@ class BeliefIndexer:
 # ============================ HYBRID (PF + DRQN) ============================ #
 @dataclass
 class HybridConfig:
-    pf_num_particles: int = 800
+    pf_num_particles: int = 300         # ↓ speed-up
     pf_resample_every: int = 3
     pf_process_noise: float = 0.75
     pf_likelihood_ang_sigma: float = 1.0
     pf_likelihood_dist_sigma: float = 1.0
     pf_topk_modes: int = 3
 
-    # obs one-hot dim: ang16 + dist10 + far1 + face8 + coin4 + see2 = 41
     obs_dim_onehot: int = 41
-    # belief feature dim = 2(mean) + 1(mean_dist) + 1(var_trace) + 1(entropy) + 2*topk(=6) = 11
-    belief_feat_dim: int = 11
+    belief_feat_dim: int = 11          # 2(mean)+1(dist)+1(vartrace)+1(entropy)+2*topk(=6)
 
     hidden: int = 128
     n_actions: int = 15
@@ -411,36 +423,27 @@ class HybridConfig:
 
     replay_capacity: int = 50_000
     batch_size: int = 16
-    seq_len: int = 60        # burn_in + unroll
 
     eps_start: float = 0.2
     eps_final: float = 0.02
     eps_decay: float = 0.9995
-
-    # viz pruning (시각화 사본 전용)
-    viz_min_edge_count: int = 3
-    viz_topk_per_node: int = 2
-    viz_k_core: int = 2
-    viz_keep_largest: bool = True
 
 def obs_to_onehot(obs: Tuple[int,int,bool,int,int,int]) -> np.ndarray:
     ang, dist, far, face, coin_bin, see = obs
     v = []
     def oh(i, n):
         a = np.zeros(n, dtype=np.float32); a[int(i)%n] = 1.0; return a
-    v.append(oh(ang, 16))                     # 16
-    v.append(oh(9 if far else dist, 10))      # 10
-    v.append(np.array([1.0 if far else 0.0], dtype=np.float32)) # 1
-    v.append(oh(face, 8))                     # 8
-    v.append(oh(coin_bin, 4))                 # 4
-    v.append(oh(see, 2))                      # 2
-    return np.concatenate(v, axis=0)          # 41
+    v.append(oh(ang, 16))                           # 16
+    v.append(oh(9 if far else dist, 10))            # 10
+    v.append(np.array([1.0 if far else 0.0], np.float32)) # 1
+    v.append(oh(face, 8))                           # 8
+    v.append(oh(coin_bin, 4))                       # 4
+    v.append(oh(see, 2))                            # 2
+    return np.concatenate(v, axis=0)                # 41
 
 class ParticleFilter:
     def __init__(self, cfg: HybridConfig, grid_size:int, fov_radius:int, seed:int=0):
-        self.cfg = cfg
-        self.n = grid_size
-        self.fov = fov_radius
+        self.cfg = cfg; self.n = grid_size; self.fov = fov_radius
         self.rng = np.random.default_rng(seed)
         self.num = cfg.pf_num_particles
         self.p = None; self.w = None; self._steps = 0
@@ -455,8 +458,7 @@ class ParticleFilter:
     def predict(self, my_move: Tuple[int,int]=(0,0)):
         dx, dy = my_move
         self.p[:,0] -= dx; self.p[:,1] -= dy
-        noise = self.cfg.pf_process_noise
-        jitter = self.rng.normal(0.0, noise, size=self.p.shape).astype(np.float32)
+        jitter = self.rng.normal(0.0, self.cfg.pf_process_noise, size=self.p.shape).astype(np.float32)
         self.p += jitter
         self.p[:,0] = np.clip(self.p[:,0], -self.n+1, self.n-1)
         self.p[:,1] = np.clip(self.p[:,1], -self.n+1, self.n-1)
@@ -484,68 +486,43 @@ class ParticleFilter:
         pred_dist = np.array([9 if pred_far[i] else self._dist_bin10(dist_mh[i])
                               for i in range(self.num)], dtype=np.int32)
 
-        ang_sigma = self.cfg.pf_likelihood_ang_sigma
-        dist_sigma = self.cfg.pf_likelihood_dist_sigma
-
-        def ang_circ_delta(a,b):
-            d = abs((a-b)%16)
-            return min(d, 16-d)
-
-        ang_err = np.array([ang_circ_delta(pred_ang[i], ang) for i in range(self.num)], dtype=np.float32)
+        def circ(a,b):
+            d = abs((a-b)%16); return min(d, 16-d)
+        ang_err = np.array([circ(pred_ang[i], ang) for i in range(self.num)], dtype=np.float32)
         dist_err = np.abs(pred_dist - (9 if far else dist)).astype(np.float32)
 
-        like_ang = np.exp(-(ang_err**2)/(2*(ang_sigma**2)))
-        like_dst = np.exp(-(dist_err**2)/(2*(dist_sigma**2)))
-        like = like_ang * like_dst + 1e-8
-
+        s1, s2 = self.cfg.pf_likelihood_ang_sigma, self.cfg.pf_likelihood_dist_sigma
+        like = np.exp(-(ang_err**2)/(2*s1**2)) * np.exp(-(dist_err**2)/(2*s2**2)) + 1e-8
         self.w *= like
         s = float(self.w.sum(dtype=np.float64))
-        if (not np.isfinite(s)) or (s <= 0.0):
-            self.w.fill(1.0 / self.num)
+        if (not np.isfinite(s)) or s<=0.0:
+            self.w.fill(1.0/self.num)
         else:
             self.w = (self.w / s).astype(np.float32)
-
         if (self._steps % self.cfg.pf_resample_every)==0:
             self._systematic_resample()
 
     def _systematic_resample(self):
         N = self.num
         positions = (np.arange(N, dtype=np.float64) + float(self.rng.random())) / float(N)
-
-        cumsum = np.cumsum(self.w, dtype=np.float64)
-        if cumsum[-1] <= 0.0 or (not np.isfinite(cumsum[-1])):
-            self.w.fill(1.0 / N)
-            cumsum = np.cumsum(self.w, dtype=np.float64)
-        cumsum[-1] = 1.0
-
-        indexes = np.searchsorted(cumsum, positions, side='left')
-        indexes = np.minimum(indexes, N - 1)
-
-        self.p = self.p[indexes]
-        self.w.fill(1.0 / N)
-
-    def entropy(self) -> float:
-        w = np.clip(self.w, 1e-12, 1.0)
-        return float(-(w*np.log(w)).sum() / math.log(len(w)))
+        cumsum = np.cumsum(self.w, dtype=np.float64); cumsum[-1] = 1.0
+        idx = np.searchsorted(cumsum, positions, side='left')
+        idx = np.minimum(idx, N-1)
+        self.p = self.p[idx]; self.w.fill(1.0/N)
 
     def summarize(self, topk:int=None) -> np.ndarray:
         if topk is None: topk = self.cfg.pf_topk_modes
         mean = (self.w[:,None]*self.p).sum(axis=0)
         var_trace = (self.w[:,None]*((self.p-mean)**2)).sum(axis=0).sum()
         mean_dist = (np.abs(self.p).sum(axis=1)*self.w).sum()
-        entropy = self.entropy()
-
-        idx = np.argsort(-self.w)[:topk]
-        top = self.p[idx]
-
+        w = np.clip(self.w, 1e-12, 1.0)
+        entropy = float(-(w*np.log(w)).sum() / math.log(len(w)))
+        idx = np.argsort(-self.w)[:topk]; top = self.p[idx]
         s = float(self.n)
         feats = [mean[0]/s, mean[1]/s, mean_dist/(2*s), min(1.0, var_trace/(s*s)), entropy]
         for i in range(topk):
-            if i < len(top):
-                feats.extend([float(top[i,0]/s), float(top[i,1]/s)])
-            else:
-                feats.extend([0.0, 0.0])
-        # 총 11차원
+            if i < len(top): feats.extend([float(top[i,0]/s), float(top[i,1]/s)])
+            else: feats.extend([0.0, 0.0])
         return np.array(feats, dtype=np.float32)
 
 class DRQN(nn.Module):
@@ -568,14 +545,11 @@ class DRQN(nn.Module):
         return Q, hT
 
 class SeqReplay:
-    def __init__(self, capacity:int, seq_len:int):
+    def __init__(self, capacity:int):
         self.capacity = capacity
-        self.seq_len = seq_len
-        self.data = []
+        self.data: List[Dict[str,np.ndarray]] = []
         self.ptr = 0
     def push_episode(self, traj: Dict[str, np.ndarray]):
-        if len(traj["act"]) < 2:
-            return
         if len(self.data) < self.capacity:
             self.data.append(traj)
         else:
@@ -584,17 +558,15 @@ class SeqReplay:
     def sample_batch(self, batch:int, burn_in:int, unroll:int):
         if len(self.data) < batch: return None
         out = []
+        seqs = random.sample(self.data, batch)
         need = burn_in + unroll + 1
-        tries = 0
-        while len(out) < batch and tries < 200:
-            ep = random.choice(self.data)
+        for ep in seqs:
             T = len(ep["act"])
-            if T >= need:
-                start = random.randint(0, T - need)
-                sl = slice(start, start+need)
-                out.append({k: v[sl] for k,v in ep.items()})
-            tries += 1
-        return out if len(out)==batch else None
+            if T < need: return None
+            start = random.randint(0, T-need)
+            sl = slice(start, start+need)
+            out.append({k: v[sl] for k,v in ep.items()})
+        return out
 
 class HybridAgent:
     def __init__(self, hycfg: HybridConfig, device: str="cpu"):
@@ -630,11 +602,10 @@ class HybridAgent:
         a = int(torch.argmax(q, dim=-1).item())
         return a, h2
 
-    def train_batch(self, batch: List[Dict[str,np.ndarray]], gamma: float, n_step:int=1):
+    def train_batch(self, batch: List[Dict[str,np.ndarray]], gamma: float, burn:int, unroll:int):
         if batch is None: return 0.0
         device = self.device
         B = len(batch)
-        burn, unroll = self.cfg.burn_in, self.cfg.unroll
 
         def to_t(name):
             X = np.stack([b[name] for b in batch],0)
@@ -645,18 +616,15 @@ class HybridAgent:
         r = torch.from_numpy(np.stack([b["rew"] for b in batch],0)).float().to(device)
         d = torch.from_numpy(np.stack([b["done"] for b in batch],0)).float().to(device)
 
-        # burn-in 은닉상태 추정
-        _, h = self.net(x[:, :burn, :])
-
-        # 온라인 Q (현재)
-        q_on, _ = self.net(x[:, burn:-1, :], h)                      # (B, unroll, A)
-        q_sel = q_on.gather(-1, a[:, burn:-1].unsqueeze(-1)).squeeze(-1)  # (B, unroll)
-
-        # Double DQN target
         with torch.no_grad():
-            q_on_next, _  = self.net(x[:, burn+1:, :], h)            # (B, unroll, A)
-            a_star = torch.argmax(q_on_next, dim=-1)                 # (B, unroll)
-            q_tgt_next, _ = self.tgt(x[:, burn+1:, :], h)            # (B, unroll, A)
+            _, h = self.net(x[:, :burn, :])
+        q_on, _ = self.net(x[:, burn:-1, :], h)                      # (B, unroll, A)
+        q_sel = q_on.gather(-1, a[:, burn:-1].unsqueeze(-1)).squeeze(-1)
+
+        with torch.no_grad():
+            q_on_next, _  = self.net(x[:, burn+1:, :], h)
+            a_star = torch.argmax(q_on_next, dim=-1)
+            q_tgt_next, _ = self.tgt(x[:, burn+1:, :], h)
             q_next = q_tgt_next.gather(-1, a_star.unsqueeze(-1)).squeeze(-1)
 
         target = r[:, burn:burn+unroll] + gamma * (1.0 - d[:, burn:burn+unroll]) * q_next
@@ -669,169 +637,124 @@ class HybridAgent:
         self.step_count += 1
         if (self.step_count % self.cfg.target_update) == 0:
             self.tgt.load_state_dict(self.net.state_dict())
+        self.decay_eps()
         return float(loss.item())
 
-# ============================ UTIL: movement delta ========================== #
+# ============================ ACTION COMMIT UTIL ============================ #
 def my_move_delta_from_action(action_idx:int, my_face_bin:int) -> Tuple[int,int]:
-    if action_idx==6:   vx,vy = dir_to_vec(my_face_bin)         # FORWARD
-    elif action_idx==7: vx,vy = dir_to_vec((my_face_bin-2)%8)   # STRAFE_L
-    elif action_idx==8: vx,vy = dir_to_vec((my_face_bin+2)%8)   # STRAFE_R
-    elif action_idx==9: vx,vy = dir_to_vec((my_face_bin+4)%8)   # BACKSTEP
+    def vec(f): return DIRS8[f%8]
+    if action_idx==6:   vx,vy = vec(my_face_bin)         # FORWARD
+    elif action_idx==7: vx,vy = vec((my_face_bin-2)%8)   # STRAFE_L
+    elif action_idx==8: vx,vy = vec((my_face_bin+2)%8)   # STRAFE_R
+    elif action_idx==9: vx,vy = vec((my_face_bin+4)%8)   # BACKSTEP
     else:               vx,vy = (0,0)
     return (vx,vy)
 
-# ============================ PROGRESS / FILTER ============================= #
-def compute_pf_entropy(pf: ParticleFilter) -> float:
-    return pf.entropy()
-
-def is_informative_step(role:str,
-                        obs_prev, obs_next,
-                        r_who: float,
-                        pf_ent_prev: float, pf_ent_new: float,
-                        env_before: Tuple[Tuple[int,int],int,Tuple[int,int],int],
-                        env_after:  Tuple[Tuple[int,int],int,Tuple[int,int],int],
-                        coins_before:int, coins_after:int,
-                        coin_dist_prev:int, coin_dist_new:int) -> bool:
+def committed_action(next_new_action_idx: int,
+                     last_action_idx: Optional[int],
+                     commit_left: int,
+                     action_commit_map: Dict[str,int]) -> Tuple[int,int,Optional[int]]:
     """
-    POMDP 본질 유지: '관찰 변화/정보이득/목표진전' 중심의 필터.
-    아래 중 하나라도 True면 informative:
-      - 보상 발생 (|r| > eps)
-      - far->near 전환 (LOS 진입/유지 변화)
-      - PF 엔트로피 유의미 감소 (정보이득) : drop > 0.02
-      - chaser: d_ce 감소, evader: 코인까지 거리 감소 또는 코인 수집 증가
+    Return (action_idx_to_execute, new_commit_left, maybe_reset_last_action_idx).
     """
-    eps = 1e-8
-    if abs(r_who) > 1e-6:
-        return True
+    if commit_left > 0 and last_action_idx is not None:
+        # keep last action
+        return last_action_idx, commit_left-1, last_action_idx
+    # start a new commit window
+    kind = ACTIONS[next_new_action_idx][0]
+    dur = action_commit_map.get(kind, 1)
+    return next_new_action_idx, max(0, dur-1), next_new_action_idx
 
-    far_prev = obs_prev[2]; far_new = obs_next[2]
-    if (far_prev and not far_new) or (not far_prev and far_new):
-        return True
-
-    if (pf_ent_prev - pf_ent_new) > 0.02:
-        return True
-
-    (c0, fc0, e0, fe0) = env_before
-    (c1, fc1, e1, fe1) = env_after
-    d0 = manhattan(c0, e0); d1 = manhattan(c1, e1)
-
-    if role=="chaser":
-        if d1 < d0: return True
-    else:
-        if coins_after > coins_before: return True
-        if coin_dist_new < coin_dist_prev: return True
-
-    return False
-
-# ============================ RUN / LEARN (episode) ======================== #
+# ============================ EPISODE (train) ============================== #
 def play_episode_and_learn(env: TwoAgentTagEnv,
                            who: str,
                            agent_self: HybridAgent,
                            agent_other: HybridAgent,
                            pf_self: ParticleFilter,
-                           pf_oth: ParticleFilter,
+                           pf_other: Optional[ParticleFilter],
                            replay: SeqReplay,
-                           max_steps:int=1000):
-    """한 에피소드 수행. 'who' 에이전트만 학습 데이터 수집/학습."""
+                           cfg: Config,
+                           hycfg: HybridConfig,
+                           train_mode=True):
     assert who in ("chaser","evader")
     env.reset()
-    pf_self.reset(); pf_oth.reset()
-    beliefs = BeliefIndexer()
+    pf_self.reset()
+    if pf_other is not None: pf_other.reset()
 
     xs, acts, rews, dones = [], [], [], []
     h_self = None; h_oth = None
 
-    ob_s = env.observe(for_chaser=(who=="chaser"), eval_mode=False)
-    ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=False)
+    # action commit trackers
+    last_a_self: Optional[int] = None; commit_left_self = 0
+    last_a_oth:  Optional[int] = None; commit_left_oth  = 0
+
+    ob_s = env.observe(for_chaser=(who=="chaser"), eval_mode=not train_mode)
+    ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=not train_mode)
 
     sum_r_c = 0.0; sum_r_e = 0.0
     steps = 0; captured=False
 
-    # for info bonus & filter
-    pf_ent_prev = compute_pf_entropy(pf_self)
-    prev_evader_collected = env.evader_collected
-    # evader coin distance (for filter)
-    _, coin_d_prev = env._nearest_coin_dist(env.state[2])
+    no_prog = 0
+    def any_event(ev): return ev["capture"] or ev["coin_collected"] or ev["decoy"] or ev["distance_change"]
 
-    # 비정보 구간에서도 너무 희소해지지 않도록, N스텝마다 1프레임은 강제 보존
-    KEEP_EVERY = 20
-    keep_counter = 0
-
-    while steps < max_steps:
+    while steps < cfg.max_steps:
         x_self = np.concatenate([obs_to_onehot(ob_s), pf_self.summarize()], axis=0)
-        x_oth  = np.concatenate([obs_to_onehot(ob_o), pf_oth.summarize()],  axis=0)
+        if pf_other is not None:
+            x_oth  = np.concatenate([obs_to_onehot(ob_o), pf_other.summarize()], axis=0)
+        else:
+            x_oth  = np.concatenate([obs_to_onehot(ob_o), np.zeros(hycfg.belief_feat_dim, np.float32)], axis=0)
 
-        a_s, h_self = agent_self.act_eps(x_self, h_self)
-        a_o, h_oth  = agent_other.act_greedy(x_oth, h_oth)
+        # action proposal
+        a_prop_self,   h_self = (agent_self.act_eps(x_self, h_self) if train_mode else agent_self.act_greedy(x_self, h_self))
+        a_prop_other,  h_oth  = agent_other.act_greedy(x_oth, h_oth)
 
-        # env step (state snapshot for filter)
-        state_before = env.state
+        # apply commit windows
+        a_s, commit_left_self, last_a_self = committed_action(a_prop_self, last_a_self, commit_left_self, cfg.action_commit)
+        a_o, commit_left_oth,  last_a_oth  = committed_action(a_prop_other, last_a_oth,  commit_left_oth,  cfg.action_commit)
+
+        # env step
         if who=="chaser":
-            _, (r_c, r_e), done = env.step(a_s, a_o, eval_mode=False)
+            _, (r_c, r_e), done, evs = env.step(a_s, a_o, eval_mode=not train_mode)
             r_who = r_c
         else:
-            _, (r_c, r_e), done = env.step(a_o, a_s, eval_mode=False)
+            _, (r_c, r_e), done, evs = env.step(a_o, a_s, eval_mode=not train_mode)
             r_who = r_e
-        state_after = env.state
 
         sum_r_c += r_c; sum_r_e += r_e
 
-        # PF 업데이트 (self)
+        # PF updates (self)
         my_face_bin = ob_s[3]
-        pf_self.predict(my_move=my_move_delta_from_action(a_s, my_face_bin))
-        ob_s_next = env.observe(for_chaser=(who=="chaser"), eval_mode=False)
+        pf_self.predict(my_move=my_move_delta_from_action(a_s if who=="chaser" else a_o, my_face_bin))
+        ob_s_next = env.observe(for_chaser=(who=="chaser"), eval_mode=not train_mode)
         pf_self.weight_update(ob_s_next)
-        pf_ent_new = compute_pf_entropy(pf_self)
 
-        # 정보이득 LOOK 보너스 (외부 shaping)
-        if ACTIONS[a_s][0] == "LOOK":
-            drop = pf_ent_prev - pf_ent_new
-            if drop > 0.02:
-                r_who += 0.0005  # k_info 역할(조건부)
+        # store transition (who-perspective)
+        xs.append(np.concatenate([obs_to_onehot(ob_s), pf_self.summarize()], axis=0))
+        acts.append(a_s if who=="chaser" else a_o)
+        rews.append(r_who); dones.append(1.0 if done else 0.0)
 
-        # 상대 PF도 갱신(평가·정책 결정을 위해)
-        my_face_bin_o = ob_o[3]
-        pf_oth.predict(my_move=my_move_delta_from_action(a_o, my_face_bin_o))
-        ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=False)
-        pf_oth.weight_update(ob_o)
+        # PF other (optional light model; for speed set pf_other=None)
+        if pf_other is not None:
+            my_face_bin_o = ob_o[3]
+            pf_other.predict(my_move=my_move_delta_from_action(a_o if who=="chaser" else a_s, my_face_bin_o))
+            ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=not train_mode)
+            pf_other.weight_update(ob_o)
+        else:
+            ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=not train_mode)
 
-        # 필터 판단
-        coin_d_new = env._nearest_coin_dist(env.state[2])[1]
-        informative = is_informative_step(
-            who, ob_s, ob_s_next, r_who,
-            pf_ent_prev, pf_ent_new,
-            state_before, state_after,
-            prev_evader_collected, env.evader_collected,
-            coin_d_prev, coin_d_new
-        )
-        keep_counter = (keep_counter + 1) % KEEP_EVERY
-
-        if informative or keep_counter==0:
-            xs.append(np.concatenate([obs_to_onehot(ob_s), pf_self.summarize()], axis=0))
-            acts.append(a_s)
-            rews.append(r_who)
-            dones.append(1.0 if done else 0.0)
-
-        # 다음 루프 준비
         ob_s = ob_s_next
-        pf_ent_prev = pf_ent_new
-        prev_evader_collected = env.evader_collected
-        coin_d_prev = coin_d_new
-
         steps += 1
+
+        # early stop (train only)
+        if train_mode:
+            if any_event(evs): no_prog = 0
+            else: no_prog += 1
+            if no_prog >= cfg.no_progress_patience:
+                break
+
         if done:
             captured=True
             break
-
-    # 최소 길이 가드
-    if len(acts) < 2:
-        # 마지막 상태라도 2스텝 맞추도록 보강
-        if len(acts)==1:
-            xs.append(xs[-1]); acts.append(acts[-1]); rews.append(rews[-1]); dones.append(1.0)
-        else:
-            # 전혀 없으면 더미 한 스텝 생성
-            xs = [np.concatenate([obs_to_onehot(ob_s), pf_self.summarize()], axis=0)]*2
-            acts = [0,0]; rews=[0.0,0.0]; dones=[1.0,1.0]
 
     traj = {
         "x":   np.stack(xs,0).astype(np.float32),
@@ -841,283 +764,31 @@ def play_episode_and_learn(env: TwoAgentTagEnv,
     }
     replay.push_episode(traj)
 
-    # 미니배치 학습
-    batch = replay.sample_batch(agent_self.cfg.batch_size, agent_self.cfg.burn_in, agent_self.cfg.unroll)
-    loss = agent_self.train_batch(batch, agent_self.cfg.gamma, n_step=agent_self.cfg.n_step) if batch else 0.0
-    agent_self.decay_eps()
+    # one minibatch
+    batch = replay.sample_batch(batch=hycfg.batch_size, burn_in=hycfg.burn_in, unroll=hycfg.unroll)
+    loss = agent_self.train_batch(batch, hycfg.gamma, hycfg.burn_in, hycfg.unroll) if (train_mode and batch) else 0.0
 
-    return steps, sum_r_c, sum_r_e, captured, float(loss)
+    return {
+        "steps": steps,
+        "sum_r_c": sum_r_c,
+        "sum_r_e": sum_r_e,
+        "captured": captured,
+        "loss": float(loss)
+    }
 
-# ======================== EVAL: traj & bins (PNG용) ======================== #
-def run_episode_collect_traj_hybrid(env, who: str,
-                                    agent_self: HybridAgent,
-                                    agent_other: HybridAgent,
-                                    pf_self: ParticleFilter,
-                                    pf_oth: ParticleFilter,
-                                    max_steps:int=1000):
-    env.reset()
-    pf_self.reset(); pf_oth.reset()
-    beliefs = BeliefIndexer()
+# ============================ EVAL (greedy) ================================ #
+def eval_episode(env: TwoAgentTagEnv,
+                 who: str,
+                 agent_self: HybridAgent,
+                 agent_other: HybridAgent,
+                 pf_self: ParticleFilter,
+                 cfg: Config,
+                 hycfg: HybridConfig):
+    return play_episode_and_learn(env, who, agent_self, agent_other, pf_self, None,
+                                  replay=SeqReplay(1), cfg=cfg, hycfg=hycfg, train_mode=False)
 
-    ob_s = env.observe(for_chaser=(who=="chaser"), eval_mode=True)
-    ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=True)
-    b = beliefs.index(ob_s)
-    traj_bins = [b]
-    sum_r = 0.0
-    actions_taken = []
-    h_self = None; h_oth = None
-
-    for _ in range(max_steps):
-        x_self = np.concatenate([obs_to_onehot(ob_s), pf_self.summarize()], axis=0)
-        a_s, h_self = agent_self.act_greedy(x_self, h_self)
-
-        x_oth = np.concatenate([obs_to_onehot(ob_o), pf_oth.summarize()], axis=0)
-        a_o, h_oth = agent_other.act_greedy(x_oth, h_oth)
-
-        if who=="chaser":
-            _, (r_c, r_e), done = env.step(a_s, a_o, eval_mode=True)
-            sum_r += r_c
-        else:
-            _, (r_c, r_e), done = env.step(a_o, a_s, eval_mode=True)
-            sum_r += r_e
-
-        my_face_bin = ob_s[3]
-        pf_self.predict(my_move=my_move_delta_from_action(a_s, my_face_bin))
-        ob_s = env.observe(for_chaser=(who=="chaser"), eval_mode=True)
-        pf_self.weight_update(ob_s)
-
-        my_face_bin_o = ob_o[3]
-        pf_oth.predict(my_move=my_move_delta_from_action(a_o, my_face_bin_o))
-        ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=True)
-        pf_oth.weight_update(ob_o)
-
-        actions_taken.append(a_s)
-        traj_bins.append(beliefs.index(ob_s))
-        if done: break
-
-    return {"sum_reward": sum_r,
-            "steps": len(traj_bins)-1,
-            "traj_bins": traj_bins,
-            "actions": actions_taken}
-
-# ======================== Episode Trajectory (PNG) ========================== #
-def save_traj_png_only(traj_info, base_name: str, annotate_actions: bool = True):
-    traj = traj_info["traj_bins"]
-    acts = traj_info.get("actions", [])
-    if not traj: return
-
-    G = nx.DiGraph()
-    unique_nodes = list(dict.fromkeys(traj))
-    G.add_nodes_from(unique_nodes)
-    for i in range(len(traj)-1):
-        G.add_edge(traj[i], traj[i+1])
-
-    first_visit = {}
-    for step, b in enumerate(traj):
-        if b not in first_visit: first_visit[b] = step
-
-    max_step = max(first_visit.values()) if first_visit else 0
-    denom = max(1, max_step)
-
-    nodes = list(G.nodes())
-    colors = [first_visit.get(n, 0)/denom for n in nodes]
-
-    try:    pos = nx.kamada_kawai_layout(G)
-    except: pos = nx.spring_layout(G, seed=42)
-
-    plt.figure(figsize=(9,9))
-    if G.number_of_edges() > 0:
-        nx.draw_networkx_edges(G, pos, alpha=0.15, width=0.5, arrows=False)
-
-    sc = nx.draw_networkx_nodes(G, pos, nodelist=nodes,
-                                node_size=25 if G.number_of_edges()>0 else 60,
-                                node_color=colors, cmap=plt.cm.plasma,
-                                vmin=0.0, vmax=1.0, alpha=0.95)
-
-    if annotate_actions and len(traj)>1 and len(acts)>0:
-        labels = {}
-        for i in range(min(len(acts), len(traj)-1)):
-            dst = traj[i+1]
-            labels[dst] = ACTIONS[acts[i]][0]
-        nx.draw_networkx_labels(G, pos, labels=labels, font_size=6)
-
-    if G.number_of_edges()==0:
-        start_node = traj[0]
-        nx.draw_networkx_labels(G, pos, labels={start_node:"START"}, font_size=7)
-
-    plt.colorbar(sc, fraction=0.046, pad=0.04, label="first-visit (early→late)")
-    plt.title(f"Episode diffusion (sum_r={traj_info['sum_reward']:.3f}, steps={traj_info['steps']})")
-    plt.axis('off')
-    png_path = os.path.join(MEDIA_DIR, f"{base_name}.png")
-    plt.tight_layout(); plt.savefig(png_path, dpi=150); plt.close()
-    print(f"[saved PNG] {png_path}")
-
-    meta = {"base_name": base_name, "sum_reward": traj_info["sum_reward"],
-            "steps": traj_info["steps"], "png": f"{base_name}.png"}
-    with open(os.path.join(LOGS_DIR, f"{base_name}.meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-
-# ======================= Combined Top-10% Graph (PNG) ====================== #
-def build_combined_graph(top_eps: List[dict]):
-    G = nx.DiGraph()
-    node_visits = Counter()
-    action_counter = defaultdict(Counter)
-    for info in top_eps:
-        traj = info["traj_bins"]; acts = info.get("actions", [])
-        for b in traj: node_visits[b] += 1
-        for i in range(len(traj)-1):
-            u, v = traj[i], traj[i+1]
-            G.add_edge(u, v)
-            if i < len(acts):
-                action_counter[v][acts[i]] += 1
-    node_action_mode = {n: (action_counter[n].most_common(1)[0][0] if action_counter[n] else 0)
-                        for n in G.nodes()}
-    return G, node_action_mode, node_visits
-
-def save_combined_graph_png(G, node_action_mode, node_visits,
-                            base_name: str, title="Top-10% Combined Graph",
-                            cap_edges: int = 12000):
-    edges = list(G.edges())
-    if len(edges) > cap_edges:
-        rng = np.random.default_rng(42)
-        edges = [edges[i] for i in rng.choice(len(edges), size=cap_edges, replace=False)]
-    H = nx.DiGraph(); H.add_edges_from(edges)
-    if H.number_of_nodes()>0:
-        comps = sorted(nx.weakly_connected_components(H), key=len, reverse=True)
-        H = H.subgraph(comps[0]).copy()
-    pos = nx.kamada_kawai_layout(H) if H.number_of_nodes()>0 else {}
-    cmap = plt.cm.get_cmap("tab20", NUM_ACTIONS)
-    nodes = list(H.nodes())
-    colors = [cmap(node_action_mode.get(n, 0)) for n in nodes]
-    sizes = [12 + 8*math.log2(1 + node_visits.get(n, 1)) for n in nodes]
-    plt.figure(figsize=(10,10))
-    nx.draw_networkx_edges(H, pos, alpha=0.12, width=0.6, arrows=False)
-    nx.draw_networkx_nodes(H, pos, node_size=sizes, node_color=colors, alpha=0.95)
-    plt.title(title); plt.axis('off'); plt.tight_layout()
-    png_path = os.path.join(MEDIA_DIR, f"{base_name}.png")
-    plt.savefig(png_path, dpi=150); plt.close()
-    print(f"[combined png] {png_path}")
-
-# ============= Policy Graph (best-episode bins only) + PRUNING ============= #
-@dataclass
-class PolicyGraph:
-    node_labels: Dict[int,int]
-    edges: List[Tuple[int,int]]
-
-def estimate_graph_hybrid(env: TwoAgentTagEnv,
-                          beliefs: BeliefIndexer,
-                          agent_self: HybridAgent,
-                          agent_other: HybridAgent,
-                          who: str,
-                          bin_indices: List[int],
-                          samples_per_bin:int=20,
-                          rollout_len:int=2,
-                          topk_per_node:int=2,
-                          exclude_far_next: bool = True,
-                          epsilon_eval: float = 0.10) -> PolicyGraph:
-    node_labels: Dict[int,int] = {}
-    transitions: Dict[int, Dict[int,int]] = {b:{} for b in bin_indices}
-    action_mode: Dict[int, Counter] = {b:Counter() for b in bin_indices}
-
-    def pick_eval_action(x, h):
-        if random.random() < epsilon_eval:
-            movable = [i for i,(k,_) in enumerate(ACTIONS)
-                       if k in ("FORWARD","STRAFE_L","STRAFE_R","BACKSTEP",
-                                "ROT+1","ROT-1","ROT+2","ROT-2","SPIN","TAKE_CORNER")]
-            return random.choice(movable), h
-        a, h2 = agent_self.act_greedy(x, h); return a, h2
-
-    start_ts = time.strftime("%Y-%m-%d %H:%M:%S"); t0=time.time()
-    print(f"[graph][start {start_ts}] {who}: bins={len(bin_indices)}, samples={samples_per_bin}, rollout={rollout_len}")
-
-    pf = ParticleFilter(HybridConfig(), env.cfg.grid_size, env.cfg.fov_radius, seed=0)
-
-    for b in bin_indices:
-        for _ in range(samples_per_bin):
-            env.reset(); pf.reset()
-            for __ in range(24):
-                ob = env.observe(for_chaser=(who=="chaser"), eval_mode=True)
-                if beliefs.index(ob)==b: break
-                env.step(random.randrange(NUM_ACTIONS), random.randrange(NUM_ACTIONS), eval_mode=True)
-            h_self=None; h_oth=None
-            ob_s = env.observe(for_chaser=(who=="chaser"), eval_mode=True)
-            ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=True)
-            for __ in range(rollout_len):
-                x = np.concatenate([obs_to_onehot(ob_s), pf.summarize()], axis=0)
-                a_s, h_self = pick_eval_action(x, h_self)
-                x_o = np.concatenate([obs_to_onehot(ob_o), pf.summarize()], axis=0)
-                a_o, h_oth = agent_other.act_greedy(x_o, h_oth)
-                if who=="chaser": env.step(a_s, a_o, eval_mode=True)
-                else:             env.step(a_o, a_s, eval_mode=True)
-                my_face_bin = ob_s[3]
-                pf.predict(my_move=my_move_delta_from_action(a_s, my_face_bin))
-                ob_s = env.observe(for_chaser=(who=="chaser"), eval_mode=True)
-                ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=True)
-                pf.weight_update(ob_s)
-
-            nxt_obs = env.observe(for_chaser=(who=="chaser"), eval_mode=True)
-            if exclude_far_next and nxt_obs[2]:  # far=True
-                continue
-            nb = beliefs.index(nxt_obs)
-            transitions[b][nb] = transitions[b].get(nb, 0) + 1
-            action_mode[b][a_s] += 1
-
-    edges = []
-    for b in bin_indices:
-        if not transitions[b]: continue
-        items = sorted(transitions[b].items(), key=lambda kv: kv[1], reverse=True)
-        for nb,_ in items[:topk_per_node]:
-            if nb != b: edges.append((b,nb))
-        node_labels[b] = action_mode[b].most_common(1)[0][0] if action_mode[b] else 0
-
-    dur = time.time()-t0; end_ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[graph][end   {end_ts}] {who}: took {dur:.1f}s, edges={len(edges)}")
-    return PolicyGraph(node_labels, edges)
-
-def draw_policy_graph_pruned(pg: PolicyGraph,
-                             title: str,
-                             save_path: str,
-                             k_core:int=2,
-                             keep_largest:bool=True,
-                             edge_cap:int=5000):
-    nodes = set(pg.node_labels.keys())
-    edges = [(u,v) for (u,v) in pg.edges if u in nodes and v in nodes and u!=v]
-    if len(edges) > edge_cap:
-        rng = np.random.default_rng(42)
-        edges = [edges[i] for i in rng.choice(len(edges), size=edge_cap, replace=False)]
-    G = nx.DiGraph()
-    G.add_nodes_from(nodes); G.add_edges_from(edges)
-    if k_core and G.number_of_nodes()>0 and G.number_of_edges()>0:
-        try: G = nx.k_core(G, k=k_core)
-        except: pass
-    if keep_largest and G.number_of_nodes()>0 and G.number_of_edges()>0:
-        comps = sorted(nx.weakly_connected_components(G), key=len, reverse=True)
-        G = G.subgraph(comps[0]).copy()
-
-    if G.number_of_nodes()==0:
-        plt.figure(figsize=(8,8)); plt.title(title+" (empty)")
-        plt.axis('off'); plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close(); return
-
-    pos = nx.kamada_kawai_layout(G)
-    cols = [pg.node_labels.get(i, -1) for i in G.nodes()]
-    plt.figure(figsize=(10,10)); plt.title(title)
-    nx.draw_networkx_nodes(G, pos, node_size=28, node_color=cols, cmap=plt.cm.viridis)
-    nx.draw_networkx_edges(G, pos, alpha=0.18, arrows=False, width=0.6)
-    labels = {n: f"{pg.node_labels.get(n,0):02d}:{ACTIONS[pg.node_labels.get(n,0)][0]}" for n in G.nodes()}
-    nx.draw_networkx_labels(G, pos, labels=labels, font_size=6)
-    plt.axis('off'); plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
-
-# =============================== IO HELPERS =================================#
-class StopFlag:
-    def __init__(self): self.flag=False
-def stop_listener(sf: StopFlag):
-    try:
-        s = input("학습 중지하려면 'q' 입력 후 ENTER: ").strip().lower()
-        if s == 'q': sf.flag=True
-    except: pass
-
-def save_model(applied_path_pt: str, meta_path_json: str, agent: HybridAgent, role: str):
-    torch.save(agent.net.state_dict(), applied_path_pt)
+# ============================ LOGGING / JSON =============================== #
+def save_applied_json(role:str, agent:HybridAgent, path_pt:str, path_json:str):
     meta = {
         "role": role,
         "arch": "DRQN(Dueling)-GRU",
@@ -1126,33 +797,181 @@ def save_model(applied_path_pt: str, meta_path_json: str, agent: HybridAgent, ro
         "hidden": agent.cfg.hidden,
         "n_actions": agent.cfg.n_actions,
         "gamma": agent.cfg.gamma,
-        "eps": agent.eps,
-        "step_count": agent.step_count,
-        "file": os.path.basename(applied_path_pt)
+        "eps": round(agent.eps, 5),
+        "step_count": int(agent.step_count),
+        "checkpoint": os.path.basename(path_pt),
+        "checkpoint_fullpath": os.path.abspath(path_pt),
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
-    with open(meta_path_json, "w", encoding="utf-8") as f:
+    with open(path_json, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
+def save_phase_log_json(role:str, outer:int, ep_start:int, ep_end:int, agg:dict):
+    # ep_start..ep_end inclusive block summary (e.g., every 1,000)
+    name = f"log_{role}_outer{outer}_ep{ep_start}-{ep_end}_{time.strftime('%Y%m%d-%H%M%S')}.json"
+    path = os.path.join(LOGS_DIR, name)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(agg, f, ensure_ascii=False, indent=2)
+
+def summarize_episode_for_unreal(stats: dict, who:str, extra:dict=None):
+    # Minimal schema for UE parsing (extend as needed)
+    # stats from play_episode_and_learn(): steps,sum_r_c,sum_r_e,captured,loss
+    d = {
+        "who": who,
+        "steps": int(stats["steps"]),
+        "reward_chaser": float(stats["sum_r_c"]),
+        "reward_evader": float(stats["sum_r_e"]),
+        "captured": bool(stats["captured"])
+    }
+    if extra: d.update(extra)
+    return d
+
+def filter_meaningful(episodes: List[dict], role:str):
+    # role-specific filters
+    if role == "chaser":
+        # meaningful: captured True or large positive r_c
+        return [e for e in episodes if e.get("captured", False) or e.get("reward_chaser",0.0) > 0.5]
+    else:
+        # evader: collected coins or long survival or high r_e
+        return [e for e in episodes if (e.get("coins",0)>0) or (e.get("steps",0)>400) or e.get("reward_evader",0.0) > 1.0]
+
+# ============================= CURRICULUM EVAL ============================= #
+# 간단 2v2 평가: 같은 정책(가중치 공유)로 각각의 유닛이 독립적으로 행동 선택.
+# 관찰은 가장 가까운 상대 기준으로 구성(빠른 프로토타입).
+class TeamTagEvalEnv:
+    def __init__(self, cfg: Config, n_team:int=2, grid:int=40):
+        # lightweight eval env
+        self.cfg = Config(**{**cfg.__dict__, "grid_size": grid})
+        self.n = grid
+        self.n_team = n_team
+        self.reset()
+
+    def reset(self):
+        # chasers & evaders spawn far apart, coins for evader team shared
+        self.ch = []
+        self.ev = []
+        for _ in range(self.n_team):
+            self.ch.append((random.randrange(self.n), random.randrange(self.n), random.randrange(8)))
+            self.ev.append((random.randrange(self.n), random.randrange(self.n), random.randrange(8)))
+        self.ev_collected = 0
+        return True
+
+    def nearest(self, me_pos, others):
+        # manhattan nearest
+        dmin=10**9; best=None
+        for (x,y,_) in others:
+            d = manhattan(me_pos, (x,y))
+            if d<dmin: dmin=d; best=(x,y)
+        return best, dmin
+
+    def observe_one(self, me:Tuple[int,int,int], others:List[Tuple[int,int,int]]):
+        (x,y,f) = me
+        tgt,_ = self.nearest((x,y), others)
+        dx,dy = tgt[0]-x, tgt[1]-y
+        d = abs(dx)+abs(dy); far = d > self.cfg.fov_radius
+        ang = angle_bin_from_dxdy16(dx,dy) if not far else 0
+        dist_bin = 9 if far else TwoAgentTagEnv._dist_bin(self, d)
+        coin_bin, see_coin = 3, 0
+        return (ang, dist_bin, far, f, coin_bin, see_coin)
+
+    def step_one(self, me, a_idx, target_pos):
+        (x,y,f) = me
+        kind,_ = ACTIONS[a_idx]
+        if kind.startswith("ROT"):
+            step = ACTIONS[a_idx][1][0]; f=(f+step)%8
+        elif kind=="SPIN": f=(f+4)%8
+        elif kind=="FORWARD":
+            vx,vy = dir_to_vec(f); x,y = add_pos((x,y),(vx,vy), self.n)
+        elif kind=="STRAFE_L":
+            vx,vy = dir_to_vec((f-2)%8); x,y = add_pos((x,y),(vx,vy), self.n)
+        elif kind=="STRAFE_R":
+            vx,vy = dir_to_vec((f+2)%8); x,y = add_pos((x,y),(vx,vy), self.n)
+        elif kind=="BACKSTEP":
+            vx,vy = dir_to_vec((f+4)%8); x,y = add_pos((x,y),(vx,vy), self.n)
+        elif kind=="TAKE_CORNER":
+            dx,dy = target_pos[0]-x, target_pos[1]-y
+            desired = angle_bin_from_dxdy16(dx,dy)%8
+            diff=(desired-f)%8; f=(f+(+1 if diff<=4 else -1))%8
+            vx,vy = dir_to_vec(f); x,y = add_pos((x,y),(vx,vy), self.n)
+        # LOOK/FOCUS/DECOY/COLLECT: no-op for this lightweight eval shell
+        return (x,y,f)
+
+    def step(self, a_ch: List[int], a_ev: List[int]):
+        # apply actions
+        new_ch = []; new_ev=[]
+        for i,(x,y,f) in enumerate(self.ch):
+            tgt,_ = self.nearest((x,y), [(ex,ey,ef) for (ex,ey,ef) in self.ev])
+            new_ch.append(self.step_one((x,y,f), a_ch[i], tgt))
+        for i,(x,y,f) in enumerate(self.ev):
+            tgt,_ = self.nearest((x,y), [(cx,cy,cf) for (cx,cy,cf) in self.ch])
+            new_ev.append(self.step_one((x,y,f), a_ev[i], tgt))
+        self.ch = new_ch; self.ev = new_ev
+
+        # capture check (any close)
+        captured_pairs = 0
+        for (cx,cy,_) in self.ch:
+            for (ex,ey,_) in self.ev:
+                if manhattan((cx,cy), (ex,ey)) <= self.cfg.capture_radius:
+                    captured_pairs += 1
+        return captured_pairs
+
+def curriculum_eval_2v2(agent_ch:HybridAgent, agent_ev:HybridAgent, base_cfg:Config, hycfg:HybridConfig,
+                        episodes:int=10, max_steps:int=400):
+    env = TeamTagEvalEnv(base_cfg, n_team=2, grid=40)
+    out=[]
+    for _ in range(episodes):
+        env.reset()
+        # PFs per unit omitted (lightweight test). Use zeros.
+        hch=[None,None]; hev=[None,None]
+        steps=0; captures=0
+        while steps<max_steps:
+            a_ch=[]; a_ev=[]
+            for i in range(2):
+                ob = env.observe_one(env.ch[i], env.ev)
+                x = np.concatenate([obs_to_onehot(ob), np.zeros(hycfg.belief_feat_dim, np.float32)], axis=0)
+                ai, hch[i] = agent_ch.act_greedy(x, hch[i]); a_ch.append(ai)
+            for i in range(2):
+                ob = env.observe_one(env.ev[i], env.ch)
+                x = np.concatenate([obs_to_onehot(ob), np.zeros(hycfg.belief_feat_dim, np.float32)], axis=0)
+                ai, hev[i] = agent_ev.act_greedy(x, hev[i]); a_ev.append(ai)
+            captures += env.step(a_ch, a_ev)
+            steps+=1
+        out.append({"steps":steps, "captures":captures})
+    return out
+
 # =========================== TRAIN FOREVER LOOP =============================#
-def train_forever_accuracy(
+class StopFlag:
+    def __init__(self): self.flag=False
+def stop_listener(sf: StopFlag):
+    try:
+        s = input("학습 중지하려면 'q' 입력 후 ENTER: ").strip().lower()
+        if s == 'q': sf.flag=True
+    except: pass
+
+def train_forever(
     cfg: Config = Config(),
-    SHOW_EVERY=100,        # 테스트에 적당. 크게 돌리려면 1000/10000
-    PRINT_EVERY=10,
-    traj_max_steps=1000,   # 에피소드 스텝가드 = 1000
-    EVAL_EVERY=20,
-    POOL_LIMIT=200
+    hycfg: HybridConfig = HybridConfig(),
+    SHOW_EVERY=10000,        # episodes per phase for one role
+    PRINT_EVERY=1000,        # console print block
+    EVAL_POOL_EVERY=250,     # push eval episode into pool
+    POOL_LIMIT=500,          # per phase
+    LOG_BLOCK=1000,          # save JSON every 1000 eps
+    CURRICULUM_AFTER_OUTER: Optional[int]=None,  # if set, after that outer index run 2v2 eval
+    CURRICULUM_EVAL_EPISODES:int=10
 ):
+    random.seed(cfg.seed); np.random.seed(cfg.seed); torch.manual_seed(cfg.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
     env = TwoAgentTagEnv(cfg)
-    beliefs = BeliefIndexer()
-    hycfg = HybridConfig()
+    beliefs = BeliefIndexer()  # kept for compatibility (not used for learning)
 
     chaser = HybridAgent(hycfg, device=device)
     evader = HybridAgent(hycfg, device=device)
+
+    # For speed, only self PF is used; other PF is None
     pf_ch = ParticleFilter(hycfg, cfg.grid_size, cfg.fov_radius, seed=0)
     pf_ev = ParticleFilter(hycfg, cfg.grid_size, cfg.fov_radius, seed=1)
-
-    replay = SeqReplay(hycfg.replay_capacity, hycfg.seq_len)
+    replay = SeqReplay(hycfg.replay_capacity)
 
     sf = StopFlag()
     threading.Thread(target=stop_listener, args=(sf,), daemon=True).start()
@@ -1160,152 +979,139 @@ def train_forever_accuracy(
     outer = 1
     while not sf.flag:
         # -------------------- Phase A: Chaser updates -------------------- #
-        steps_acc = 0; r_c_acc = 0.0; r_e_acc = 0.0; cap_cnt = 0
-        best_score = -1e18; best_info = None
-        ep_pool: List[dict] = []
-        avg_loss = 0.0; loss_cnt=0
+        block_start = 1
+        pool=[]
+        agg_block = {"role":"chaser","outer":outer,"blocks":[]}
+        ep_rewards=[]
+
+        steps_acc = r_c_acc = r_e_acc = 0.0
+        cap_cnt = 0; loss_acc=0.0; loss_cnt=0
 
         for ep in range(1, SHOW_EVERY+1):
+            res = play_episode_and_learn(env,"chaser", chaser, evader, pf_ch, None, replay, cfg, hycfg, train_mode=True)
+            steps_acc += res["steps"]; r_c_acc += res["sum_r_c"]; r_e_acc += res["sum_r_e"]; cap_cnt += int(res["captured"])
+            loss_acc += res["loss"]; loss_cnt+=1
+            ep_rewards.append(res["sum_r_c"])
+
+            # pool push
+            if (ep % EVAL_POOL_EVERY)==0 and len(pool)<POOL_LIMIT:
+                ev = eval_episode(env,"chaser",chaser,evader,pf_ch,cfg,hycfg)
+                pool.append(summarize_episode_for_unreal(ev,"chaser"))
+
+            # block log save
+            if (ep % LOG_BLOCK)==0:
+                avg_loss = (loss_acc/max(1,loss_cnt))
+                block = {
+                    "episodes": [block_start, ep],
+                    "avg_steps": steps_acc/LOG_BLOCK,
+                    "avg_reward_chaser": r_c_acc/LOG_BLOCK,
+                    "avg_reward_evader": r_e_acc/LOG_BLOCK,
+                    "capture_rate": cap_cnt/LOG_BLOCK,
+                    "avg_loss": avg_loss,
+                    "epsilon": chaser.eps
+                }
+                save_phase_log_json("chaser", outer, block_start, ep, block)
+                agg_block["blocks"].append(block)
+                # reset block accumulators
+                block_start = ep+1
+                steps_acc = r_c_acc = r_e_acc = 0.0
+                cap_cnt = 0; loss_acc=0.0; loss_cnt=0
+
             if sf.flag: break
-            steps, sr_c, sr_e, cap, loss = play_episode_and_learn(
-                env, "chaser", chaser, evader, pf_ch, pf_ev, replay, max_steps=traj_max_steps)
-            steps_acc += steps; r_c_acc += sr_c; r_e_acc += sr_e; cap_cnt += int(cap)
-            avg_loss += loss; loss_cnt += 1
-            if sr_c > best_score:
-                best_score = sr_c
-                best_info = run_episode_collect_traj_hybrid(env, "chaser", chaser, evader, pf_ch, pf_ev, max_steps=traj_max_steps)
             if (ep % PRINT_EVERY)==0:
-                print(f"[Chaser] Outer {outer}  {ep}/{SHOW_EVERY}  eps={chaser.eps:.3f}  loss={ (avg_loss/max(1,loss_cnt)):.4f}")
-            if (ep % EVAL_EVERY == 0) and (len(ep_pool) < POOL_LIMIT):
-                info_eval = run_episode_collect_traj_hybrid(env, "chaser", chaser, evader, pf_ch, pf_ev, max_steps=traj_max_steps)
-                ep_pool.append(info_eval)
+                print(f"[Chaser] outer {outer} ep {ep}/{SHOW_EVERY} eps={chaser.eps:.3f}")
+
         if sf.flag: break
 
-        applied_pt = os.path.join(APPLIED_DIR, "chaser_policy.pt")
-        applied_meta = os.path.join(APPLIED_DIR, "chaser_policy.meta.json")
-        save_model(applied_pt, applied_meta, chaser, "chaser")
-
+        # applied save
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        snap_pt_c = os.path.join(SNAPSHOT_DIR, f"chaser_outer{outer}_ep{SHOW_EVERY}_{stamp}.pt")
-        torch.save(chaser.net.state_dict(), snap_pt_c)
+        pt_path = os.path.join(APPLIED_DIR, "chaser_policy.pt")
+        torch.save(chaser.net.state_dict(), pt_path)
+        save_applied_json("chaser", chaser, pt_path, os.path.join(APPLIED_DIR,"chaser_applied.json"))
+        # snapshot
+        torch.save(chaser.net.state_dict(), os.path.join(SNAP_DIR, f"chaser_outer{outer}_{stamp}.pt"))
 
-        if best_info is not None and best_info["traj_bins"]:
-            best_bins = sorted(set(best_info["traj_bins"]))
-            pg_c = estimate_graph_hybrid(env, beliefs, chaser, evader, who="chaser",
-                                         bin_indices=best_bins,
-                                         samples_per_bin=20, rollout_len=2,
-                                         topk_per_node=2, exclude_far_next=True, epsilon_eval=0.10)
-            snap_png_c = os.path.join(SNAPSHOT_DIR, f"policy_graph_best_chaser_outer{outer}_{stamp}.png")
-            draw_policy_graph_pruned(pg_c,
-                                     f"Best-Episode Policy (Chaser, outer {outer})",
-                                     snap_png_c, k_core=hycfg.viz_k_core,
-                                     keep_largest=hycfg.viz_keep_largest, edge_cap=5000)
-
-        chaser_log = {
-            "phase": "chaser",
-            "outer": outer,
-            "episodes": SHOW_EVERY,
-            "timestamp": stamp,
-            "avg_steps": steps_acc/SHOW_EVERY,
-            "avg_reward_chaser": r_c_acc/SHOW_EVERY,
-            "avg_reward_evader": r_e_acc/SHOW_EVERY,
-            "capture_rate": cap_cnt/SHOW_EVERY,
-            "epsilon_chaser": chaser.eps,
-            "epsilon_evader": evader.eps,
-            "avg_loss": (avg_loss/max(1,loss_cnt))
-        }
-        with open(os.path.join(LOGS_DIR, f"log_chaser_outer{outer}_ep{SHOW_EVERY}_{stamp}.json"), "w", encoding="utf-8") as f:
-            json.dump(chaser_log, f, ensure_ascii=False, indent=2)
-
-        if best_info is not None:
-            save_traj_png_only(best_info, base_name=f"best_chaser_outer{outer}_{stamp}", annotate_actions=True)
-
-        if ep_pool:
-            ep_pool_sorted = sorted(ep_pool, key=lambda d: d["sum_reward"], reverse=True)
-            k = max(1, math.ceil(0.10 * len(ep_pool_sorted)))
-            top_eps = ep_pool_sorted[:k]
-            Gc, node_action_mode, node_visits = build_combined_graph(top_eps)
-            save_combined_graph_png(Gc, node_action_mode, node_visits,
-                                    base_name=f"combined_top10p_chaser_outer{outer}_{stamp}",
-                                    title=f"Chaser Combined Top-10% (outer {outer})")
+        # top-10% meaningful episodes JSON
+        if pool:
+            pool_sorted = sorted(pool, key=lambda d: d["reward_chaser"], reverse=True)
+            k = max(1, math.ceil(0.10*len(pool_sorted)))
+            top_eps = pool_sorted[:k]
+            # add role-specific extras (optionally attach action hist etc. if you log them)
+            meaningful = filter_meaningful(top_eps, "chaser")
+            with open(os.path.join(LOGS_DIR, f"top10p_meaningful_chaser_outer{outer}_{stamp}.json"), "w", encoding="utf-8") as f:
+                json.dump({"outer":outer,"role":"chaser","episodes":meaningful}, f, ensure_ascii=False, indent=2)
 
         # -------------------- Phase B: Evader updates -------------------- #
-        steps_acc = 0; r_c_acc = 0.0; r_e_acc = 0.0; cap_cnt = 0
-        best_score = -1e18; best_info = None
-        ep_pool = []; avg_loss=0.0; loss_cnt=0
+        block_start = 1
+        pool=[]
+        steps_acc = r_c_acc = r_e_acc = 0.0
+        cap_cnt = 0; loss_acc=0.0; loss_cnt=0
 
         for ep in range(1, SHOW_EVERY+1):
+            res = play_episode_and_learn(env,"evader", evader, chaser, pf_ev, None, replay, cfg, hycfg, train_mode=True)
+            steps_acc += res["steps"]; r_c_acc += res["sum_r_c"]; r_e_acc += res["sum_r_e"]; cap_cnt += int(res["captured"])
+            loss_acc += res["loss"]; loss_cnt+=1
+
+            if (ep % EVAL_POOL_EVERY)==0 and len(pool)<POOL_LIMIT:
+                ev = eval_episode(env,"evader",evader,chaser,pf_ev,cfg,hycfg)
+                # 여기서 코인 수집 추정치는 평과셸에선 없으므로 0으로 둠(원하면 학습 env 기반 별도 계산 추가)
+                pool.append(summarize_episode_for_unreal(ev,"evader", extra={"coins":0}))
+
+            if (ep % LOG_BLOCK)==0:
+                avg_loss = (loss_acc/max(1,loss_cnt))
+                block = {
+                    "episodes": [block_start, ep],
+                    "avg_steps": steps_acc/LOG_BLOCK,
+                    "avg_reward_chaser": r_c_acc/LOG_BLOCK,
+                    "avg_reward_evader": r_e_acc/LOG_BLOCK,
+                    "capture_rate": cap_cnt/LOG_BLOCK,
+                    "avg_loss": avg_loss,
+                    "epsilon": evader.eps
+                }
+                save_phase_log_json("evader", outer, block_start, ep, block)
+                block_start = ep+1
+                steps_acc = r_c_acc = r_e_acc = 0.0
+                cap_cnt = 0; loss_acc=0.0; loss_cnt=0
+
             if sf.flag: break
-            steps, sr_c, sr_e, cap, loss = play_episode_and_learn(
-                env, "evader", evader, chaser, pf_ev, pf_ch, replay, max_steps=traj_max_steps)
-            steps_acc += steps; r_c_acc += sr_c; r_e_acc += sr_e; cap_cnt += int(cap)
-            avg_loss += loss; loss_cnt += 1
-            if sr_e > best_score:
-                best_score = sr_e
-                best_info = run_episode_collect_traj_hybrid(env, "evader", evader, chaser, pf_ev, pf_ch, max_steps=traj_max_steps)
             if (ep % PRINT_EVERY)==0:
-                print(f"[Evader] Outer {outer}  {ep}/{SHOW_EVERY}  eps={evader.eps:.3f}  loss={ (avg_loss/max(1,loss_cnt)):.4f}")
-            if (ep % EVAL_EVERY == 0) and (len(ep_pool) < POOL_LIMIT):
-                info_eval = run_episode_collect_traj_hybrid(env, "evader", evader, chaser, pf_ev, pf_ch, max_steps=traj_max_steps)
-                ep_pool.append(info_eval)
+                print(f"[Evader] outer {outer} ep {ep}/{SHOW_EVERY} eps={evader.eps:.3f}")
+
         if sf.flag: break
 
-        applied_pt = os.path.join(APPLIED_DIR, "evader_policy.pt")
-        applied_meta = os.path.join(APPLIED_DIR, "evader_policy.meta.json")
-        save_model(applied_pt, applied_meta, evader, "evader")
+        # applied save
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        snap_pt_e = os.path.join(SNAPSHOT_DIR, f"evader_outer{outer}_ep{SHOW_EVERY}_{stamp}.pt")
-        torch.save(evader.net.state_dict(), snap_pt_e)
+        pt_path = os.path.join(APPLIED_DIR, "evader_policy.pt")
+        torch.save(evader.net.state_dict(), pt_path)
+        save_applied_json("evader", evader, pt_path, os.path.join(APPLIED_DIR,"evader_applied.json"))
+        torch.save(evader.net.state_dict(), os.path.join(SNAP_DIR, f"evader_outer{outer}_{stamp}.pt"))
 
-        if best_info is not None and best_info["traj_bins"]:
-            best_bins = sorted(set(best_info["traj_bins"]))
-            pg_e = estimate_graph_hybrid(env, beliefs, evader, chaser, who="evader",
-                                         bin_indices=best_bins,
-                                         samples_per_bin=20, rollout_len=2,
-                                         topk_per_node=2, exclude_far_next=True, epsilon_eval=0.10)
-            snap_png_e = os.path.join(SNAPSHOT_DIR, f"policy_graph_best_evader_outer{outer}_{stamp}.png")
-            draw_policy_graph_pruned(pg_e,
-                                     f"Best-Episode Policy (Evader, outer {outer})",
-                                     snap_png_e, k_core=hycfg.viz_k_core,
-                                     keep_largest=hycfg.viz_keep_largest, edge_cap=5000)
+        if pool:
+            pool_sorted = sorted(pool, key=lambda d: d["reward_evader"], reverse=True)
+            k = max(1, math.ceil(0.10*len(pool_sorted)))
+            top_eps = pool_sorted[:k]
+            meaningful = filter_meaningful(top_eps, "evader")
+            with open(os.path.join(LOGS_DIR, f"top10p_meaningful_evader_outer{outer}_{stamp}.json"), "w", encoding="utf-8") as f:
+                json.dump({"outer":outer,"role":"evader","episodes":meaningful}, f, ensure_ascii=False, indent=2)
 
-        evader_log = {
-            "phase": "evader",
-            "outer": outer,
-            "episodes": SHOW_EVERY,
-            "timestamp": stamp,
-            "avg_steps": steps_acc/SHOW_EVERY,
-            "avg_reward_chaser": r_c_acc/SHOW_EVERY,
-            "avg_reward_evader": r_e_acc/SHOW_EVERY,
-            "capture_rate": cap_cnt/SHOW_EVERY,
-            "epsilon_chaser": chaser.eps,
-            "epsilon_evader": evader.eps,
-            "avg_loss": (avg_loss/max(1,loss_cnt))
-        }
-        with open(os.path.join(LOGS_DIR, f"log_evader_outer{outer}_ep{SHOW_EVERY}_{stamp}.json"), "w", encoding="utf-8") as f:
-            json.dump(evader_log, f, ensure_ascii=False, indent=2)
-
-        if best_info is not None:
-            save_traj_png_only(best_info, base_name=f"best_evader_outer{outer}_{stamp}", annotate_actions=True)
-
-        if ep_pool:
-            ep_pool_sorted = sorted(ep_pool, key=lambda d: d["sum_reward"], reverse=True)
-            k = max(1, math.ceil(0.10 * len(ep_pool_sorted)))
-            top_eps = ep_pool_sorted[:k]
-            Ge, node_action_mode, node_visits = build_combined_graph(top_eps)
-            save_combined_graph_png(Ge, node_action_mode, node_visits,
-                                    base_name=f"combined_top10p_evader_outer{outer}_{stamp}",
-                                    title=f"Evader Combined Top-10% (outer {outer})")
+        # Optional curriculum evaluation (2v2 on 40x40) after certain outer
+        if CURRICULUM_AFTER_OUTER is not None and outer >= CURRICULUM_AFTER_OUTER:
+            cur = curriculum_eval_2v2(chaser, evader, cfg, hycfg, episodes=CURRICULUM_EVAL_EPISODES, max_steps=400)
+            with open(os.path.join(LOGS_DIR, f"curriculum_eval_2v2_outer{outer}_{stamp}.json"), "w", encoding="utf-8") as f:
+                json.dump({"outer":outer,"mode":"2v2_40x40","episodes":cur}, f, ensure_ascii=False, indent=2)
 
         outer += 1
 
 # ================================ MAIN ===================================== #
 if __name__ == "__main__":
-    train_forever_accuracy(
-        cfg=Config(),
-        SHOW_EVERY=1000,      # 필요시 1000/10000으로
-        PRINT_EVERY=100,
-        traj_max_steps=1000, # 스텝가드 1000
-        EVAL_EVERY=20,
-        POOL_LIMIT=200
+    train_forever(
+        cfg=Config(max_steps=1000, no_progress_patience=120),
+        hycfg=HybridConfig(),
+        SHOW_EVERY=10000,
+        PRINT_EVERY=1000,
+        EVAL_POOL_EVERY=250,
+        POOL_LIMIT=500,
+        LOG_BLOCK=1000,
+        CURRICULUM_AFTER_OUTER=2,       # 예: 2번째 외부 페이즈 이후 2v2 평가 실행
+        CURRICULUM_EVAL_EPISODES=10
     )
