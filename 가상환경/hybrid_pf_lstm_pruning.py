@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# Hybrid POMDP RL (PF-DRQN) — JSON-first pipeline (no images)
-# - PF(200) + ESS resample, observation one-hot + belief summary -> DRQN(GRU) dueling head
+# Hybrid POMDP RL (PF-DRQN) — JSON-first pipeline (Torch PF + tensor-direct I/O + fixed replay sampler)
+# - PF(torch) + ESS resample, observation one-hot + belief summary -> DRQN(GRU) dueling head
 # - Opponent uses epsilon-greedy (ε=0.05) during training phases
 # - Step guard 1,000 + "no-progress" early stop
 # - Every 1,000 episodes per phase: save logs + overwrite applied policy (.pt + meta.json)
@@ -13,9 +13,6 @@
 #     snapshots/  : timestamped .pt snapshots (optional)
 #     logs/       : per-phase logs + pool summaries
 #     eval/       : episode JSONs (top10p significant, best-episode, bigmap tests)
-#
-# NOTE: training remains 1v1. A test hook for 40x40 is provided. (2v2 hook placeholder)
-#       Keep this file single and self-contained.
 
 import os, time, json, math, random, shutil, threading
 from dataclasses import dataclass
@@ -80,7 +77,7 @@ class EnvConfig:
     # coins
     coin_count: int = 5
     coin_collect_ticks: int = 5
-    r_collect_tick: float = 0.3     # ← 코인중심 강화
+    r_collect_tick: float = 0.3
     r_collect_done: float = 1.2
     r_all_coins_bonus: float = 6.0
 
@@ -104,9 +101,9 @@ class EnvConfig:
 @dataclass
 class HybridConfig:
     # PF
-    pf_num_particles: int = 200             # ← lowered
-    pf_resample_every: int = 3              # periodic guard
-    pf_ess_threshold: float = 0.5           # ESS/N < 0.5 → resample
+    pf_num_particles: int = 200
+    pf_resample_every: int = 3
+    pf_ess_threshold: float = 0.5
     pf_process_noise: float = 0.7
     pf_lik_ang_sigma: float = 1.0
     pf_lik_dist_sigma: float = 1.0
@@ -150,7 +147,7 @@ class TrainSchedule:
 
 # --------------------------- Actions (15) ----------------------------------- #
 ACTIONS: List[Tuple[str, Tuple]] = [
-    ("WAIT", ()),                   # cost 0
+    ("WAIT", ()),
     ("ROT+1", (+1,)), ("ROT-1", (-1,)),
     ("ROT+2", (+2,)), ("ROT-2", (-2,)),
     ("SPIN", ()),
@@ -158,10 +155,10 @@ ACTIONS: List[Tuple[str, Tuple]] = [
     ("STRAFE_L", ("L", 1)), ("STRAFE_R", ("R", 1)),
     ("BACKSTEP", (1,)),
     ("LOOK", ()),
-    ("FOCUS", ()),                 # extend fov, cut noise
+    ("FOCUS", ()),
     ("TAKE_CORNER", ()),
-    ("COLLECT", ()),               # evader only
-    ("DECOY", ()),                 # evader only
+    ("COLLECT", ()),
+    ("DECOY", ()),
 ]
 NUM_ACTIONS = len(ACTIONS)
 
@@ -399,112 +396,121 @@ class BeliefIndexer:
     @property
     def n_bins(self): return self.na*self.nd*self.nf*self.nc*self.ns
 
-def obs_to_onehot(obs):
+def obs_to_onehot_torch(obs, device):
     ang, dist, far, face, coin_bin, see = obs
     v=[]
     def oh(i,n):
-        a = np.zeros(n, dtype=np.float32); a[int(i)%n] = 1.0; return a
+        t = torch.zeros(n, device=device, dtype=torch.float32)
+        t[int(i)%n] = 1.0
+        return t
     v.append(oh(ang,16))                 # 16
     v.append(oh(9 if far else dist,10))  # 10
-    v.append(np.array([1.0 if far else 0.0], dtype=np.float32)) #1
+    v.append(torch.tensor([1.0 if far else 0.0], device=device, dtype=torch.float32)) #1
     v.append(oh(face,8))                 # 8
     v.append(oh(coin_bin,4))             # 4
     v.append(oh(see,2))                  # 2
-    return np.concatenate(v, axis=0)     # 41
+    return torch.cat(v, dim=0)           # 41
 
-# --------------------------- Particle Filter --------------------------------#
-class ParticleFilter:
-    def __init__(self, hycfg: HybridConfig, grid_size:int, fov_radius:int, seed:int=0):
+# --------------------------- Torch Particle Filter -------------------------- #
+class TorchParticleFilter:
+    """Torch-based PF (runs on CPU or CUDA), drop-in replacement API."""
+    def __init__(self, hycfg: HybridConfig, grid_size:int, fov_radius:int, seed:int=0, device:str="cpu"):
         self.cfg = hycfg
         self.n = grid_size; self.fov = fov_radius
-        self.rng = np.random.default_rng(seed)
         self.num = hycfg.pf_num_particles
+        self.device = device
+        self.rng = torch.Generator(device=device).manual_seed(seed)
         self.reset()
 
     def reset(self):
-        low = -self.n+1; high = self.n-1
-        self.p = self.rng.integers(low, high+1, size=(self.num,2)).astype(np.float32)
-        self.w = np.ones(self.num, dtype=np.float32) / self.num
+        low = -self.n + 1; high = self.n - 1
+        self.p = torch.randint(low, high + 1, (self.num, 2), generator=self.rng,
+                               device=self.device, dtype=torch.float32)
+        self.w = torch.full((self.num,), 1.0/self.num, device=self.device, dtype=torch.float32)
         self._steps = 0
 
     def predict(self, my_move=(0,0)):
-        dx,dy = my_move
+        dx, dy = my_move
         self.p[:,0] -= dx; self.p[:,1] -= dy
-        jitter = self.rng.normal(0.0, self.cfg.pf_process_noise, size=self.p.shape).astype(np.float32)
-        self.p += jitter
-        self.p[:,0] = np.clip(self.p[:,0], -self.n+1, self.n-1)
-        self.p[:,1] = np.clip(self.p[:,1], -self.n+1, self.n-1)
+        jitter = torch.normal(mean=0.0, std=self.cfg.pf_process_noise,
+                              size=self.p.shape, generator=self.rng, device=self.device)
+        self.p.add_(jitter)
+        self.p[:,0].clamp_(-self.n+1, self.n-1)
+        self.p[:,1].clamp_(-self.n+1, self.n-1)
         self._steps += 1
-
-    def _angle_bin16(self, dx, dy):
-        if dx==0 and dy==0: return 0
-        a = math.atan2(dy,dx); 
-        if a<0: a+=2*math.pi
-        return int((a + (2*math.pi/16)/2)//(2*math*pi/16)) % 16
-
-    def _dist_bin10(self, d):
-        cuts=[1,2,4,6,9,13,18,24]
-        for i,c in enumerate(cuts):
-            if d<=c: return i
-        return len(cuts)
 
     def weight_update(self, obs):
         ang, dist, far, *_ = obs
+        ang_t = torch.as_tensor(ang, device=self.device, dtype=torch.int64)
+        dist_code = torch.as_tensor(9 if far else dist, device=self.device, dtype=torch.int64)
+
         dx = self.p[:,0]; dy = self.p[:,1]
-        dist_mh = np.abs(dx)+np.abs(dy)
+        dist_mh = dx.abs() + dy.abs()
         pred_far = dist_mh > self.fov
-        # predicted bins
-        pred_ang  = np.where(pred_far, 0, np.mod(np.round((np.arctan2(dy,dx)+2*np.pi)%(2*np.pi) * 16/(2*np.pi)), 16)).astype(int)
-        pred_dist = np.where(pred_far, 9, np.clip(np.searchsorted([1,2,4,6,9,13,18,24], dist_mh, side='right'),0,9)).astype(int)
+
+        # angle bin16 with half-bin offset
+        ang_raw = torch.atan2(dy, dx)                     # [-pi, pi]
+        ang_raw = torch.where(ang_raw < 0, ang_raw + 2*math.pi, ang_raw)
+        bin_size = 2*math.pi / 16
+        pred_ang = torch.remainder(((ang_raw + bin_size/2) // bin_size), 16).to(torch.int64)
+        pred_ang = torch.where(pred_far, torch.zeros_like(pred_ang), pred_ang)
+
+        # dist bin10
+        cuts = torch.tensor([1,2,4,6,9,13,18,24], device=self.device, dtype=torch.float32)
+        pred_dist = torch.searchsorted(cuts, dist_mh, right=True).clamp(max=9).to(torch.int64)
+        pred_dist = torch.where(pred_far, torch.full_like(pred_dist, 9), pred_dist)
 
         # likelihoods
-        def ang_delta(a,b):
-            d = np.abs((a-b)%16); return np.minimum(d, 16-d)
-        ang_err  = ang_delta(pred_ang, ang).astype(np.float32)
-        dist_err = np.abs(pred_dist - (9 if far else dist)).astype(np.float32)
+        ang_err = (pred_ang - ang_t).remainder(16).abs()
+        ang_err = torch.minimum(ang_err, 16 - ang_err).to(torch.float32)
+        dist_err = (pred_dist - dist_code).abs().to(torch.float32)
 
-        like_ang = np.exp(-(ang_err**2)/(2*(self.cfg.pf_lik_ang_sigma**2)))
-        like_dst = np.exp(-(dist_err**2)/(2*(self.cfg.pf_lik_dist_sigma**2)))
+        like_ang = torch.exp(-(ang_err**2)/(2*(self.cfg.pf_lik_ang_sigma**2)))
+        like_dst = torch.exp(-(dist_err**2)/(2*(self.cfg.pf_lik_dist_sigma**2)))
         like = like_ang * like_dst + 1e-8
 
-        self.w *= like
-        s = float(self.w.sum(dtype=np.float64))
-        if (not np.isfinite(s)) or s<=0.0:
-            self.w.fill(1.0/self.num)
+        self.w.mul_(like)
+        s = self.w.sum()
+        if torch.isfinite(s) and s > 0:
+            self.w.div_(s)
         else:
-            self.w = (self.w/s).astype(np.float32)
+            self.w.fill_(1.0/self.num)
 
-        # ESS resample or periodic
-        ess = 1.0 / float(np.sum((self.w**2), dtype=np.float64))
-        if (ess/self.num) < self.cfg.pf_ess_threshold or (self._steps % self.cfg.pf_resample_every)==0:
+        # ESS or periodic resample
+        ess = 1.0 / torch.sum(self.w**2)
+        if (ess/self.num) < self.cfg.pf_ess_threshold or (self._steps % self.cfg.pf_resample_every) == 0:
             self._systematic_resample()
 
     def _systematic_resample(self):
         N = self.num
-        positions = (np.arange(N, dtype=np.float64) + float(np.random.random()))/float(N)
-        cumsum = np.cumsum(self.w, dtype=np.float64)
-        if cumsum[-1] <= 0.0 or (not np.isfinite(cumsum[-1])):
-            self.w.fill(1.0/N); cumsum = np.cumsum(self.w, dtype=np.float64)
-        cumsum[-1] = 1.0
-        idx = np.searchsorted(cumsum, positions, side='left')
-        idx = np.minimum(idx, N-1)
-        self.p = self.p[idx]
-        self.w.fill(1.0/N)
+        u = torch.rand((), generator=self.rng, device=self.device, dtype=torch.float64)
+        positions = (torch.arange(N, device=self.device, dtype=torch.float64) + u) / N
+        cumsum = torch.cumsum(self.w.to(torch.float64), dim=0)
+        cumsum[-1] = 1.0  # guard
+        idx = torch.searchsorted(cumsum, positions).clamp(max=N-1).to(torch.long)
+        self.p = self.p.index_select(0, idx)
+        self.w.fill_(1.0/N)
 
     def summarize(self, topk=None):
         if topk is None: topk = self.cfg.pf_topk_modes
-        mean = (self.w[:,None]*self.p).sum(axis=0)
-        var_trace = (self.w[:,None]*((self.p-mean)**2)).sum(axis=0).sum()
-        mean_dist = (np.abs(self.p).sum(axis=1)*self.w).sum()
-        w = np.clip(self.w, 1e-12, 1.0)
-        entropy = float(-(w*np.log(w)).sum() / math.log(len(w)))
-        idx = np.argsort(-self.w)[:topk]; top = self.p[idx]
+        w = self.w.clamp_min(1e-12)
+        mean = (w[:, None] * self.p).sum(dim=0)
+        var_trace = (w[:, None] * (self.p - mean).pow(2)).sum(dim=0).sum()
+        mean_dist = (self.p.abs().sum(dim=1) * w).sum()
+        entropy = float((-(w * torch.log(w))).sum() / math.log(len(w)))
+
+        k = min(topk, self.num)
+        top_idx = torch.topk(w, k=k, largest=True).indices
+        top = self.p.index_select(0, top_idx)
+
         s = float(self.n)
-        feats=[mean[0]/s, mean[1]/s, mean_dist/(2*s), min(1.0, var_trace/(s*s)), entropy]
+        feats = [mean[0]/s, mean[1]/s, mean_dist/(2*s), min(1.0, float(var_trace/(s*s))), entropy]
         for i in range(topk):
-            if i < len(top): feats.extend([float(top[i,0]/s), float(top[i,1]/s)])
-            else: feats.extend([0.0,0.0])
-        return np.array(feats, dtype=np.float32)
+            if i < top.shape[0]:
+                feats.extend([float(top[i, 0]/s), float(top[i, 1]/s)])
+            else:
+                feats.extend([0.0, 0.0])
+        return torch.tensor(feats, device=self.device, dtype=torch.float32)
 
 # --------------------------- DRQN model ------------------------------------ #
 class DRQN(nn.Module):
@@ -524,80 +530,119 @@ class DRQN(nn.Module):
 
 class SeqReplay:
     def __init__(self, capacity:int): self.capacity=capacity; self.data=[]; self.ptr=0
-    def push_episode(self, traj): 
+    def push_episode(self, traj):
         if len(self.data)<self.capacity: self.data.append(traj)
         else: self.data[self.ptr]=traj; self.ptr=(self.ptr+1)%self.capacity
     def __len__(self): return len(self.data)
+    # ---------- FIXED Sampler: skip short episodes instead of aborting whole batch ----------
     def sample_batch(self, batch:int, burn:int, unroll:int):
-        if len(self.data) < batch: return None
-        out=[]; seqs=random.sample(self.data, batch)
-        need = burn+unroll+1
+        if len(self.data) < batch: 
+            return None
+        need = burn + unroll + 1
+        candidates = [ep for ep in self.data if len(ep["act"]) >= need]
+        if len(candidates) < batch:
+            return None
+        seqs = random.sample(candidates, batch)
+        out=[]
         for ep in seqs:
             T=len(ep["act"])
-            if T<need: return None
             s=random.randint(0, T-need)
             sl=slice(s,s+need)
-            out.append({k:v[sl] for k,v in ep.items()})
+            out.append({k:(v[sl] if isinstance(v, np.ndarray) else v) for k,v in ep.items()})
         return out
 
 class HybridAgent:
     def __init__(self, hy: HybridConfig, device="cpu"):
         self.cfg=hy
         in_dim = hy.obs_dim_onehot + hy.belief_feat_dim
-        self.net = DRQN(in_dim, hy.hidden, hy.n_actions).to(device)
+        net = DRQN(in_dim, hy.hidden, hy.n_actions).to(device)
+        try:
+            self.net = torch.compile(net, mode="reduce-overhead")  # optional, PyTorch 2.x
+        except Exception:
+            self.net = net
         self.tgt = DRQN(in_dim, hy.hidden, hy.n_actions).to(device)
         self.tgt.load_state_dict(self.net.state_dict())
         self.optim = torch.optim.Adam(self.net.parameters(), lr=hy.lr)
         self.device=device
         self.eps=hy.eps_start
         self.step_count=0
+        self._scaler = torch.cuda.amp.GradScaler() if device.startswith("cuda") else None
 
     def decay_eps(self): self.eps = max(self.cfg.eps_final, self.eps*self.cfg.eps_decay)
 
+    # numpy path (compat)
     def q_eval(self, x, h=None):
         xt = torch.from_numpy(x).float().to(self.device).view(1,1,-1)
         with torch.no_grad():
             q,h2 = self.net(xt, h)
         return q, h2
 
-    def act_eps(self, x, h=None):
-        q,h2 = self.q_eval(x,h)
+    # tensor-direct path (preferred)
+    def q_eval_t(self, x_t: torch.Tensor, h=None):
+        xt = x_t.view(1,1,-1)
+        with torch.no_grad():
+            q,h2 = self.net(xt, h)
+        return q, h2
+
+    def act_eps_t(self, x_t: torch.Tensor, h=None):
+        q,h2 = self.q_eval_t(x_t, h)
         if random.random() < self.eps: a = random.randrange(q.shape[-1])
         else: a = int(torch.argmax(q, dim=-1).item())
         return a, h2
 
-    def act_eps_fixed(self, x, eps, h=None):
-        q,h2 = self.q_eval(x,h)
+    def act_eps_fixed_t(self, x_t: torch.Tensor, eps: float, h=None):
+        q,h2 = self.q_eval_t(x_t, h)
         if random.random() < eps: a = random.randrange(q.shape[-1])
         else: a = int(torch.argmax(q, dim=-1).item())
         return a, h2
 
-    def act_greedy(self, x, h=None):
-        q,h2=self.q_eval(x,h)
+    def act_greedy_t(self, x_t: torch.Tensor, h=None):
+        q,h2=self.q_eval_t(x_t,h)
         return int(torch.argmax(q, dim=-1).item()), h2
 
     def train_batch(self, batch, gamma, burn, unroll):
         if batch is None: return 0.0
         B=len(batch); dev=self.device
-        def to_t(name): return torch.from_numpy(np.stack([b[name] for b in batch],0)).float().to(dev)
-        x = to_t("x"); a=torch.from_numpy(np.stack([b["act"] for b in batch],0)).long().to(dev)
+        def to_t(name):
+            arr = np.stack([b[name] for b in batch], 0)  # (B, T, F) float32
+            return torch.from_numpy(arr).to(dev, dtype=torch.float32, non_blocking=True)
+        x = to_t("x")
+        a = torch.from_numpy(np.stack([b["act"] for b in batch],0)).long().to(dev, non_blocking=True)
         r = to_t("rew"); d = to_t("done")
+
         with torch.no_grad():
             _, h = self.net(x[:, :burn, :])
-        q_on, _   = self.net(x[:, burn:-1, :], h)               # (B, unroll, A)
-        q_sel = q_on.gather(-1, a[:, burn:-1].unsqueeze(-1)).squeeze(-1)
 
-        with torch.no_grad():
-            q_on_next,_  = self.net(x[:, burn+1:, :], h)
-            a_star = torch.argmax(q_on_next, dim=-1)
-            q_tgt_next,_ = self.tgt(x[:, burn+1:, :], h)
-            q_next = q_tgt_next.gather(-1, a_star.unsqueeze(-1)).squeeze(-1)
-
-        target = r[:, burn:burn+unroll] + gamma*(1.0 - d[:, burn:burn+unroll])*q_next
-        loss = F.smooth_l1_loss(q_sel, target)
-        self.optim.zero_grad(); loss.backward()
-        nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
-        self.optim.step()
+        use_amp = (self._scaler is not None)
+        if use_amp:
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                q_on, _   = self.net(x[:, burn:-1, :], h)               # (B, unroll, A)
+            q_sel = q_on.gather(-1, a[:, burn:-1].unsqueeze(-1)).squeeze(-1)
+            with torch.no_grad():
+                q_on_next,_  = self.net(x[:, burn+1:, :], h)
+                a_star = torch.argmax(q_on_next, dim=-1)
+                q_tgt_next,_ = self.tgt(x[:, burn+1:, :], h)
+                q_next = q_tgt_next.gather(-1, a_star.unsqueeze(-1)).squeeze(-1)
+            target = r[:, burn:burn+unroll] + gamma*(1.0 - d[:, burn:burn+unroll])*q_next
+            loss = F.smooth_l1_loss(q_sel, target)
+            self.optim.zero_grad(set_to_none=True)
+            self._scaler.scale(loss).backward()
+            nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+            self._scaler.step(self.optim); self._scaler.update()
+        else:
+            q_on, _   = self.net(x[:, burn:-1, :], h)
+            q_sel = q_on.gather(-1, a[:, burn:-1].unsqueeze(-1)).squeeze(-1)
+            with torch.no_grad():
+                q_on_next,_  = self.net(x[:, burn+1:, :], h)
+                a_star = torch.argmax(q_on_next, dim=-1)
+                q_tgt_next,_ = self.tgt(x[:, burn+1:, :], h)
+                q_next = q_tgt_next.gather(-1, a_star.unsqueeze(-1)).squeeze(-1)
+            target = r[:, burn:burn+unroll] + gamma*(1.0 - d[:, burn:burn+unroll])*q_next
+            loss = F.smooth_l1_loss(q_sel, target)
+            self.optim.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+            self.optim.step()
 
         self.step_count += 1
         if (self.step_count % self.cfg.target_update)==0:
@@ -623,7 +668,6 @@ def rle_encode(seq):
     return out
 
 def significant_episode(ep):
-    # Heuristic: not too short, not stuck, variety of actions
     steps = ep["steps"]
     unique = len(set(ep["traj_bins"]))
     act_hist = Counter(ep.get("actions",[]))
@@ -633,7 +677,7 @@ def significant_episode(ep):
 # --------------------------- Play episode + Learn -------------------------- #
 def play_episode_and_learn(env: TwoAgentTagEnv, who: str,
                            agent_self: HybridAgent, agent_other: HybridAgent,
-                           pf_self: ParticleFilter, pf_oth: ParticleFilter,
+                           pf_self: TorchParticleFilter, pf_oth: TorchParticleFilter,
                            replay: SeqReplay,
                            schedule: TrainSchedule,
                            hy: HybridConfig,
@@ -649,12 +693,14 @@ def play_episode_and_learn(env: TwoAgentTagEnv, who: str,
     last_b = None; stagnant=0
 
     for t in range(schedule.MAX_STEPS):
-        x_self = np.concatenate([obs_to_onehot(ob_s), pf_self.summarize()], axis=0)
-        x_oth  = np.concatenate([obs_to_onehot(ob_o), pf_oth.summarize()], axis=0)
+        # ---- tensor-direct features on the agent's device ----
+        x_self_t = torch.cat([obs_to_onehot_torch(ob_s, agent_self.device),
+                              pf_self.summarize()], dim=0)
+        x_oth_t  = torch.cat([obs_to_onehot_torch(ob_o, agent_other.device),
+                              pf_oth.summarize()], dim=0)
 
-        a_s, h_self = agent_self.act_eps(x_self, h_self)
-        # opponent ε-greedy(0.05)
-        a_o, h_oth  = agent_other.act_eps_fixed(x_oth, hy.opponent_eps, h_oth)
+        a_s, h_self = agent_self.act_eps_t(x_self_t, h_self)
+        a_o, h_oth  = agent_other.act_eps_fixed_t(x_oth_t, hy.opponent_eps, h_oth)
 
         if who=="chaser":
             _, (r_c, r_e), done = env.step(a_s, a_o, eval_mode=False); r_who = r_c
@@ -669,14 +715,13 @@ def play_episode_and_learn(env: TwoAgentTagEnv, who: str,
         ob_s_next = env.observe(for_chaser=(who=="chaser"), eval_mode=False)
         pf_self.weight_update(ob_s_next)
 
-        # opponent PF (rough)
         my_face_bin_o = ob_o[3]
         pf_oth.predict(my_move=my_move_delta_from_action(a_o, my_face_bin_o))
         ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=False)
         pf_oth.weight_update(ob_o)
 
-        # sequence (who-perspective)
-        xs.append(np.concatenate([obs_to_onehot(ob_s), pf_self.summarize()], axis=0))
+        # sequence (store as numpy for replay)
+        xs.append(x_self_t.detach().cpu().numpy())
         acts.append(a_s); rews.append(r_who); dones.append(1.0 if done else 0.0)
 
         # "no progress" early stop — if bin not changing for a while
@@ -696,25 +741,31 @@ def play_episode_and_learn(env: TwoAgentTagEnv, who: str,
     replay.push_episode(traj)
 
     batch = replay.sample_batch(agent_self.cfg.batch_size, agent_self.cfg.burn_in, agent_self.cfg.unroll)
-    loss = agent_self.train_batch(batch, agent_self.cfg.gamma, agent_self.cfg.burn_in, agent_self.cfg.unroll) if batch else 0.0
-    agent_self.decay_eps()
+    if batch is not None:
+        loss = agent_self.train_batch(batch, agent_self.cfg.gamma, agent_self.cfg.burn_in, agent_self.cfg.unroll)
+        agent_self.decay_eps()  # decay only when a real train step happened
+    else:
+        loss = 0.0
     return len(acts), sum_r_c, sum_r_e, captured, float(loss)
 
 # --------------------------- Eval (greedy) --------------------------------- #
 def rollout_greedy(env: TwoAgentTagEnv, who: str,
                    agent_self: HybridAgent, agent_other: HybridAgent,
-                   pf_self: ParticleFilter,
+                   pf_self: TorchParticleFilter,
                    max_steps:int=1000):
     env.reset(); pf_self.reset()
     ob_s = env.observe(for_chaser=(who=="chaser"), eval_mode=True)
     traj_bins=[BeliefIndexer().index(ob_s)]
     actions=[]; sum_r=0.0; h_s=None; h_o=None
     for _ in range(max_steps):
-        x_self = np.concatenate([obs_to_onehot(ob_s), pf_self.summarize()], axis=0)
-        a_s, h_s = agent_self.act_greedy(x_self, h_s)
+        x_self_t = torch.cat([obs_to_onehot_torch(ob_s, agent_self.device),
+                              pf_self.summarize()], dim=0)
+        a_s, h_s = agent_self.act_greedy_t(x_self_t, h_s)
+
         ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=True)
-        x_o  = np.concatenate([obs_to_onehot(ob_o), pf_self.summarize()], axis=0)
-        a_o, h_o = agent_other.act_greedy(x_o, h_o)
+        x_o_t  = torch.cat([obs_to_onehot_torch(ob_o, agent_other.device),
+                            pf_self.summarize()], dim=0)
+        a_o, h_o = agent_other.act_greedy_t(x_o_t, h_o)
 
         if who=="chaser":
             _, (r_c,r_e), done = env.step(a_s, a_o, eval_mode=True); sum_r += r_c
@@ -735,7 +786,7 @@ def rollout_greedy(env: TwoAgentTagEnv, who: str,
         "steps": len(traj_bins)-1,
         "traj_bins_rle": rle_encode(traj_bins),
         "actions_hist": dict(Counter(actions)),
-        "actions_seq_head": actions[:50],   # preview only
+        "actions_seq_head": actions[:50],
     }
 
 # --------------------------- Save helpers ---------------------------------- #
@@ -770,7 +821,7 @@ def save_significant_json(role:str, outer:int, stamp:str, top_eps:List[dict]):
     with open(path,"w",encoding="utf-8") as f: json.dump(sig, f, ensure_ascii=False, indent=2)
 
 # --------------------------- Training loop --------------------------------- #
-class StopFlag: 
+class StopFlag:
     def __init__(self): self.flag=False
 def stop_listener(sf:StopFlag):
     try:
@@ -783,7 +834,8 @@ def train_forever(env_cfg:EnvConfig=EnvConfig(),
                   schedule:TrainSchedule=TrainSchedule()):
     # device init
     use_cuda = torch.cuda.is_available()
-    print("CUDA available:", use_cuda, "| torch:", torch.__version__, "| py:", ".".join(map(str, list(torch.__config__.show().split())[:0])))
+    device = "cuda" if use_cuda else "cpu"
+    print(f"CUDA available: {use_cuda} | torch: {torch.__version__}")
     if use_cuda:
         try:
             torch.backends.cudnn.benchmark = True
@@ -791,14 +843,13 @@ def train_forever(env_cfg:EnvConfig=EnvConfig(),
             print("Device:", torch.cuda.get_device_name(0))
         except Exception as e:
             print("CUDA init note:", e)
-    device = "cuda" if use_cuda else "cpu"
 
     # agents / env / pf / replay
     env = TwoAgentTagEnv(env_cfg)
     chaser = HybridAgent(hycfg, device=device)
     evader = HybridAgent(hycfg, device=device)
-    pf_ch = ParticleFilter(hycfg, env_cfg.grid_size, env_cfg.fov_radius, seed=0)
-    pf_ev = ParticleFilter(hycfg, env_cfg.grid_size, env_cfg.fov_radius, seed=1)
+    pf_ch = TorchParticleFilter(hycfg, env_cfg.grid_size, env_cfg.fov_radius, seed=0, device=device)
+    pf_ev = TorchParticleFilter(hycfg, env_cfg.grid_size, env_cfg.fov_radius, seed=1, device=device)
     replay = SeqReplay(hycfg.replay_capacity)
 
     sf=StopFlag()
@@ -807,8 +858,7 @@ def train_forever(env_cfg:EnvConfig=EnvConfig(),
     outer = 1
     while not sf.flag:
         # ---------------- Phase A: Chaser update ---------------- #
-        ep_pool=[]; best=None
-        steps_acc=0; rc_acc=0.0; re_acc=0.0; cap_acc=0; avg_loss=0.0; nloss=0
+        ep_pool=[]; steps_acc=0; rc_acc=0.0; re_acc=0.0; cap_acc=0; avg_loss=0.0; nloss=0
         t0=time.time()
         for ep in range(1, schedule.SHOW_EVERY+1):
             s,rc,re,cap,loss = play_episode_and_learn(env, "chaser",
@@ -878,7 +928,7 @@ def train_forever(env_cfg:EnvConfig=EnvConfig(),
         if outer >= schedule.OUTER_SWITCH_BIGMAP:
             big = EnvConfig(grid_size=40, fov_radius=18)  # larger map & fov
             env_big = TwoAgentTagEnv(big)
-            pf_tmp = ParticleFilter(hycfg, big.grid_size, big.fov_radius, seed=7)
+            pf_tmp = TorchParticleFilter(hycfg, big.grid_size, big.fov_radius, seed=7, device=device)
             res_ch = rollout_greedy(env_big, "chaser", chaser, evader, pf_tmp, max_steps=1200)
             res_ev = rollout_greedy(env_big, "evader", evader, chaser, pf_tmp, max_steps=1200)
             with open(os.path.join(EVAL_DIR, f"bigmap_eval_outer{outer}_{stamp}.json"), "w", encoding="utf-8") as f:
