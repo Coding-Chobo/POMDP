@@ -1,23 +1,18 @@
 # -*- coding: utf-8 -*-
-# Hybrid POMDP RL (PF-DRQN) — JSON-first pipeline (Torch PF + tensor-direct I/O + fixed replay sampler)
-# - PF(torch) + ESS resample, observation one-hot + belief summary -> DRQN(GRU) dueling head
+# Hybrid POMDP RL (PF-DRQN)
+# - Torch PF + tensor-direct I/O + fixed replay sampler
+# - FIX: torch.compile() 래핑으로 생기는 state_dict 키 mismatch 해결(safe_state_dict, 초기화 순서/동기화 변경)
+# - torch.compile: Triton 없으면 aot_eager로 자동 폴백 (Windows/로컬 안전)
 # - Opponent uses epsilon-greedy (ε=0.05) during training phases
 # - Step guard 1,000 + "no-progress" early stop
 # - Every 1,000 episodes per phase: save logs + overwrite applied policy (.pt + meta.json)
 # - From evaluation pool, take top-10% episodes -> filter "significant" -> write JSON
-# - After some outer loops, also run big-map(40x40) eval and write JSON (test-only)
-#
-# Folders:
-#   outputs/
-#     applied/    : current applied policy .pt + meta.json (chaser/evader)
-#     snapshots/  : timestamped .pt snapshots (optional)
-#     logs/       : per-phase logs + pool summaries
-#     eval/       : episode JSONs (top10p significant, best-episode, bigmap tests)
+# - After some outers, also run big-map(40x40) eval and write JSON (test-only)
 
-import os, time, json, math, random, shutil, threading
+import os, time, json, math, random, threading
 from dataclasses import dataclass
-from typing import Dict, Tuple, List, Optional
-from collections import Counter, defaultdict
+from typing import Tuple, List
+from collections import Counter
 import numpy as np
 
 import torch
@@ -138,12 +133,12 @@ class HybridConfig:
 # trainer schedule
 @dataclass
 class TrainSchedule:
-    SHOW_EVERY: int = 1000      # save & rotate every 1k episodes per phase
+    SHOW_EVERY: int = 1000
     PRINT_EVERY: int = 50
     MAX_STEPS: int = 1000
     EVAL_EVERY: int = 100
     POOL_LIMIT: int = 300
-    OUTER_SWITCH_BIGMAP: int = 5  # after this outer, also eval on 40x40
+    OUTER_SWITCH_BIGMAP: int = 5
 
 # --------------------------- Actions (15) ----------------------------------- #
 ACTIONS: List[Tuple[str, Tuple]] = [
@@ -174,7 +169,6 @@ class TwoAgentTagEnv:
         self.state = None
 
     def reset(self):
-        # spawn far apart
         while True:
             c = (random.randrange(self.n), random.randrange(self.n))
             e = (random.randrange(self.n), random.randrange(self.n))
@@ -236,7 +230,6 @@ class TwoAgentTagEnv:
             pass
         return new_pos, new_face
 
-    # coins
     def _nearest_coin_dist(self, epos):
         if not self.coins: return None, 99
         dists = [(p, manhattan(epos,p)) for p in self.coins]
@@ -287,7 +280,7 @@ class TwoAgentTagEnv:
         done = done_capture or done_allcoins
 
         r_c = 1.0 if done_capture else 0.0
-        r_e = (-1.0 if done_capture else 0.02)  # small survival bonus
+        r_e = (-1.0 if done_capture else 0.02)
 
         # coin shaping
         nearest_p, d_now = self._nearest_coin_dist(e_next)
@@ -319,7 +312,7 @@ class TwoAgentTagEnv:
         if new_d <= self.cfg.threat_radius and kind_e not in ("COLLECT","DECOY"):
             r_e += self.cfg.k_threat_avoid
 
-        # action costs (FORWARD 0)
+        # action costs
         def cost(kind):
             if   kind.startswith("ROT"): return self.cfg.action_cost_rot
             elif kind == "LOOK":        return self.cfg.action_cost_look
@@ -403,17 +396,16 @@ def obs_to_onehot_torch(obs, device):
         t = torch.zeros(n, device=device, dtype=torch.float32)
         t[int(i)%n] = 1.0
         return t
-    v.append(oh(ang,16))                 # 16
-    v.append(oh(9 if far else dist,10))  # 10
-    v.append(torch.tensor([1.0 if far else 0.0], device=device, dtype=torch.float32)) #1
-    v.append(oh(face,8))                 # 8
-    v.append(oh(coin_bin,4))             # 4
-    v.append(oh(see,2))                  # 2
-    return torch.cat(v, dim=0)           # 41
+    v.append(oh(ang,16))
+    v.append(oh(9 if far else dist,10))
+    v.append(torch.tensor([1.0 if far else 0.0], device=device, dtype=torch.float32))
+    v.append(oh(face,8))
+    v.append(oh(coin_bin,4))
+    v.append(oh(see,2))
+    return torch.cat(v, dim=0)  # (41,)
 
 # --------------------------- Torch Particle Filter -------------------------- #
 class TorchParticleFilter:
-    """Torch-based PF (runs on CPU or CUDA), drop-in replacement API."""
     def __init__(self, hycfg: HybridConfig, grid_size:int, fov_radius:int, seed:int=0, device:str="cpu"):
         self.cfg = hycfg
         self.n = grid_size; self.fov = fov_radius
@@ -448,19 +440,16 @@ class TorchParticleFilter:
         dist_mh = dx.abs() + dy.abs()
         pred_far = dist_mh > self.fov
 
-        # angle bin16 with half-bin offset
-        ang_raw = torch.atan2(dy, dx)                     # [-pi, pi]
+        ang_raw = torch.atan2(dy, dx)
         ang_raw = torch.where(ang_raw < 0, ang_raw + 2*math.pi, ang_raw)
         bin_size = 2*math.pi / 16
         pred_ang = torch.remainder(((ang_raw + bin_size/2) // bin_size), 16).to(torch.int64)
         pred_ang = torch.where(pred_far, torch.zeros_like(pred_ang), pred_ang)
 
-        # dist bin10
         cuts = torch.tensor([1,2,4,6,9,13,18,24], device=self.device, dtype=torch.float32)
         pred_dist = torch.searchsorted(cuts, dist_mh, right=True).clamp(max=9).to(torch.int64)
         pred_dist = torch.where(pred_far, torch.full_like(pred_dist, 9), pred_dist)
 
-        # likelihoods
         ang_err = (pred_ang - ang_t).remainder(16).abs()
         ang_err = torch.minimum(ang_err, 16 - ang_err).to(torch.float32)
         dist_err = (pred_dist - dist_code).abs().to(torch.float32)
@@ -469,14 +458,13 @@ class TorchParticleFilter:
         like_dst = torch.exp(-(dist_err**2)/(2*(self.cfg.pf_lik_dist_sigma**2)))
         like = like_ang * like_dst + 1e-8
 
-        self.w.mul_(like)
+        self.w.mul_((like))
         s = self.w.sum()
         if torch.isfinite(s) and s > 0:
             self.w.div_(s)
         else:
-            self.w.fill_(1.0/self.num)
+            self.w.fill_((1.0/self.num))
 
-        # ESS or periodic resample
         ess = 1.0 / torch.sum(self.w**2)
         if (ess/self.num) < self.cfg.pf_ess_threshold or (self._steps % self.cfg.pf_resample_every) == 0:
             self._systematic_resample()
@@ -486,7 +474,7 @@ class TorchParticleFilter:
         u = torch.rand((), generator=self.rng, device=self.device, dtype=torch.float64)
         positions = (torch.arange(N, device=self.device, dtype=torch.float64) + u) / N
         cumsum = torch.cumsum(self.w.to(torch.float64), dim=0)
-        cumsum[-1] = 1.0  # guard
+        cumsum[-1] = 1.0
         idx = torch.searchsorted(cumsum, positions).clamp(max=N-1).to(torch.long)
         self.p = self.p.index_select(0, idx)
         self.w.fill_(1.0/N)
@@ -528,15 +516,21 @@ class DRQN(nn.Module):
         Q = V + (A - A.mean(dim=-1, keepdim=True))
         return Q, hT
 
+# --------------------------- Compile-safe state_dict ------------------------ #
+def safe_state_dict(module: torch.nn.Module):
+    """torch.compile 래핑(_orig_mod) 여부와 무관하게 순정 키로 state_dict 반환"""
+    return getattr(module, "_orig_mod", module).state_dict()
+
+# --------------------------- Replay buffer --------------------------------- #
 class SeqReplay:
     def __init__(self, capacity:int): self.capacity=capacity; self.data=[]; self.ptr=0
     def push_episode(self, traj):
         if len(self.data)<self.capacity: self.data.append(traj)
         else: self.data[self.ptr]=traj; self.ptr=(self.ptr+1)%self.capacity
     def __len__(self): return len(self.data)
-    # ---------- FIXED Sampler: skip short episodes instead of aborting whole batch ----------
+    # FIX: 짧은 에피소드 때문에 전체 배치를 포기하지 않음
     def sample_batch(self, batch:int, burn:int, unroll:int):
-        if len(self.data) < batch: 
+        if len(self.data) < batch:
             return None
         need = burn + unroll + 1
         candidates = [ep for ep in self.data if len(ep["act"]) >= need]
@@ -551,33 +545,43 @@ class SeqReplay:
             out.append({k:(v[sl] if isinstance(v, np.ndarray) else v) for k,v in ep.items()})
         return out
 
+# --------------------------- Agent ----------------------------------------- #
 class HybridAgent:
     def __init__(self, hy: HybridConfig, device="cpu"):
         self.cfg=hy
         in_dim = hy.obs_dim_onehot + hy.belief_feat_dim
-        net = DRQN(in_dim, hy.hidden, hy.n_actions).to(device)
-        try:
-            self.net = torch.compile(net, mode="reduce-overhead")  # optional, PyTorch 2.x
-        except Exception:
-            self.net = net
+
+        base = DRQN(in_dim, hy.hidden, hy.n_actions).to(device)   # compile 전
+
+        # 타깃: 컴파일 전 state_dict로 동기화(키 동일)
         self.tgt = DRQN(in_dim, hy.hidden, hy.n_actions).to(device)
-        self.tgt.load_state_dict(self.net.state_dict())
+        self.tgt.load_state_dict(base.state_dict())
+
+        # compile 시도(없으면 aot_eager 폴백)
+        self.net = self._maybe_compile(base, device)
+
         self.optim = torch.optim.Adam(self.net.parameters(), lr=hy.lr)
         self.device=device
         self.eps=hy.eps_start
         self.step_count=0
-        self._scaler = torch.cuda.amp.GradScaler() if device.startswith("cuda") else None
+        self._scaler = torch.amp.GradScaler('cuda') if device.startswith("cuda") else None
+
+    def _maybe_compile(self, base, device):
+        if not device.startswith("cuda"):
+            return base
+        try:
+            import triton  # 존재 확인
+            return torch.compile(base, mode="reduce-overhead")
+        except Exception:
+            # Triton 미설치/문제 시 aot_eager로 폴백(안전)
+            try:
+                return torch.compile(base, mode="reduce-overhead", backend="aot_eager")
+            except Exception:
+                return base  # 최종 안전 폴백
 
     def decay_eps(self): self.eps = max(self.cfg.eps_final, self.eps*self.cfg.eps_decay)
 
-    # numpy path (compat)
-    def q_eval(self, x, h=None):
-        xt = torch.from_numpy(x).float().to(self.device).view(1,1,-1)
-        with torch.no_grad():
-            q,h2 = self.net(xt, h)
-        return q, h2
-
-    # tensor-direct path (preferred)
+    # tensor-direct path
     def q_eval_t(self, x_t: torch.Tensor, h=None):
         xt = x_t.view(1,1,-1)
         with torch.no_grad():
@@ -604,7 +608,7 @@ class HybridAgent:
         if batch is None: return 0.0
         B=len(batch); dev=self.device
         def to_t(name):
-            arr = np.stack([b[name] for b in batch], 0)  # (B, T, F) float32
+            arr = np.stack([b[name] for b in batch], 0)
             return torch.from_numpy(arr).to(dev, dtype=torch.float32, non_blocking=True)
         x = to_t("x")
         a = torch.from_numpy(np.stack([b["act"] for b in batch],0)).long().to(dev, non_blocking=True)
@@ -615,16 +619,15 @@ class HybridAgent:
 
         use_amp = (self._scaler is not None)
         if use_amp:
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                q_on, _   = self.net(x[:, burn:-1, :], h)               # (B, unroll, A)
-            q_sel = q_on.gather(-1, a[:, burn:-1].unsqueeze(-1)).squeeze(-1)
-            with torch.no_grad():
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                q_on, _   = self.net(x[:, burn:-1, :], h)
+                q_sel = q_on.gather(-1, a[:, burn:-1].unsqueeze(-1)).squeeze(-1)
                 q_on_next,_  = self.net(x[:, burn+1:, :], h)
                 a_star = torch.argmax(q_on_next, dim=-1)
                 q_tgt_next,_ = self.tgt(x[:, burn+1:, :], h)
                 q_next = q_tgt_next.gather(-1, a_star.unsqueeze(-1)).squeeze(-1)
-            target = r[:, burn:burn+unroll] + gamma*(1.0 - d[:, burn:burn+unroll])*q_next
-            loss = F.smooth_l1_loss(q_sel, target)
+                target = r[:, burn:burn+unroll] + gamma*(1.0 - d[:, burn:burn+unroll])*q_next
+                loss = F.smooth_l1_loss(q_sel, target)
             self.optim.zero_grad(set_to_none=True)
             self._scaler.scale(loss).backward()
             nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
@@ -646,15 +649,16 @@ class HybridAgent:
 
         self.step_count += 1
         if (self.step_count % self.cfg.target_update)==0:
-            self.tgt.load_state_dict(self.net.state_dict())
+            # compile 여부와 무관하게 안전하게 동기화
+            self.tgt.load_state_dict(safe_state_dict(self.net))
         return float(loss.item())
 
 # --------------------------- Helpers --------------------------------------- #
 def my_move_delta_from_action(a_idx:int, my_face_bin:int):
-    if a_idx==6:   vx,vy = dir_to_vec(my_face_bin)           # FORWARD
-    elif a_idx==7: vx,vy = dir_to_vec((my_face_bin-2)%8)     # STRAFE_L
-    elif a_idx==8: vx,vy = dir_to_vec((my_face_bin+2)%8)     # STRAFE_R
-    elif a_idx==9: vx,vy = dir_to_vec((my_face_bin+4)%8)     # BACKSTEP
+    if a_idx==6:   vx,vy = dir_to_vec(my_face_bin)
+    elif a_idx==7: vx,vy = dir_to_vec((my_face_bin-2)%8)
+    elif a_idx==8: vx,vy = dir_to_vec((my_face_bin+2)%8)
+    elif a_idx==9: vx,vy = dir_to_vec((my_face_bin+4)%8)
     else:          vx,vy = (0,0)
     return (vx,vy)
 
@@ -674,7 +678,7 @@ def significant_episode(ep):
     top_act_ratio = (act_hist.most_common(1)[0][1]/max(1, len(ep.get("actions",[])))) if act_hist else 1.0
     return (steps >= 30) and (unique >= 10) and (top_act_ratio <= 0.95)
 
-# --------------------------- Play episode + Learn -------------------------- #
+# --------------------------- Play + Learn ---------------------------------- #
 def play_episode_and_learn(env: TwoAgentTagEnv, who: str,
                            agent_self: HybridAgent, agent_other: HybridAgent,
                            pf_self: TorchParticleFilter, pf_oth: TorchParticleFilter,
@@ -682,8 +686,6 @@ def play_episode_and_learn(env: TwoAgentTagEnv, who: str,
                            schedule: TrainSchedule,
                            hy: HybridConfig,
                            no_progress_limit:int=80):
-    """Return: steps, sum_r_c, sum_r_e, captured, loss"""
-    assert who in ("chaser","evader")
     env.reset(); pf_self.reset(); pf_oth.reset()
     xs, acts, rews, dones = [], [], [], []
     h_self=None; h_oth=None
@@ -692,8 +694,7 @@ def play_episode_and_learn(env: TwoAgentTagEnv, who: str,
     ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=False)
     last_b = None; stagnant=0
 
-    for t in range(schedule.MAX_STEPS):
-        # ---- tensor-direct features on the agent's device ----
+    for _ in range(schedule.MAX_STEPS):
         x_self_t = torch.cat([obs_to_onehot_torch(ob_s, agent_self.device),
                               pf_self.summarize()], dim=0)
         x_oth_t  = torch.cat([obs_to_onehot_torch(ob_o, agent_other.device),
@@ -709,7 +710,6 @@ def play_episode_and_learn(env: TwoAgentTagEnv, who: str,
 
         sum_r_c += r_c; sum_r_e += r_e
 
-        # PF updates
         my_face_bin_s = ob_s[3]
         pf_self.predict(my_move=my_move_delta_from_action(a_s, my_face_bin_s))
         ob_s_next = env.observe(for_chaser=(who=="chaser"), eval_mode=False)
@@ -720,11 +720,9 @@ def play_episode_and_learn(env: TwoAgentTagEnv, who: str,
         ob_o = env.observe(for_chaser=(who!="chaser"), eval_mode=False)
         pf_oth.weight_update(ob_o)
 
-        # sequence (store as numpy for replay)
         xs.append(x_self_t.detach().cpu().numpy())
         acts.append(a_s); rews.append(r_who); dones.append(1.0 if done else 0.0)
 
-        # "no progress" early stop — if bin not changing for a while
         b_now = BeliefIndexer().index(ob_s_next)
         if last_b is None or b_now != last_b: stagnant=0; last_b=b_now
         else: stagnant += 1
@@ -743,7 +741,7 @@ def play_episode_and_learn(env: TwoAgentTagEnv, who: str,
     batch = replay.sample_batch(agent_self.cfg.batch_size, agent_self.cfg.burn_in, agent_self.cfg.unroll)
     if batch is not None:
         loss = agent_self.train_batch(batch, agent_self.cfg.gamma, agent_self.cfg.burn_in, agent_self.cfg.unroll)
-        agent_self.decay_eps()  # decay only when a real train step happened
+        agent_self.decay_eps()
     else:
         loss = 0.0
     return len(acts), sum_r_c, sum_r_e, captured, float(loss)
@@ -772,7 +770,6 @@ def rollout_greedy(env: TwoAgentTagEnv, who: str,
         else:
             _, (r_c,r_e), done = env.step(a_o, a_s, eval_mode=True); sum_r += r_e
 
-        # update PF with new obs
         my_face = ob_s[3]; pf_self.predict(my_move=my_move_delta_from_action(a_s, my_face))
         ob_s = env.observe(for_chaser=(who=="chaser"), eval_mode=True)
         pf_self.weight_update(ob_s)
@@ -793,7 +790,8 @@ def rollout_greedy(env: TwoAgentTagEnv, who: str,
 def save_applied(role:str, agent:HybridAgent):
     pt  = os.path.join(APPLIED_DIR, f"{role}_policy.pt")
     meta= os.path.join(APPLIED_DIR, f"{role}_policy.meta.json")
-    torch.save(agent.net.state_dict(), pt)
+    # compile 여부와 무관하게 안전 저장
+    torch.save(safe_state_dict(agent.net), pt)
     m = {
         "role": role, "arch":"Dueling-DRQN(GRU)",
         "obs_dim": agent.cfg.obs_dim_onehot, "belief_dim": agent.cfg.belief_feat_dim,
@@ -832,19 +830,19 @@ def stop_listener(sf:StopFlag):
 def train_forever(env_cfg:EnvConfig=EnvConfig(),
                   hycfg:HybridConfig=HybridConfig(),
                   schedule:TrainSchedule=TrainSchedule()):
-    # device init
     use_cuda = torch.cuda.is_available()
     device = "cuda" if use_cuda else "cpu"
     print(f"CUDA available: {use_cuda} | torch: {torch.__version__}")
     if use_cuda:
         try:
+            # 최신 TF32 설정 API 사용 (경고 제거)
+            torch.backends.cuda.matmul.fp32_precision = "high"   # 또는 "ieee"
+            torch.backends.cudnn.conv.fp32_precision  = "tf32"
             torch.backends.cudnn.benchmark = True
-            torch.set_float32_matmul_precision("high")
             print("Device:", torch.cuda.get_device_name(0))
         except Exception as e:
             print("CUDA init note:", e)
 
-    # agents / env / pf / replay
     env = TwoAgentTagEnv(env_cfg)
     chaser = HybridAgent(hycfg, device=device)
     evader = HybridAgent(hycfg, device=device)
@@ -924,9 +922,9 @@ def train_forever(env_cfg:EnvConfig=EnvConfig(),
             save_pool_json("evader", outer, stamp, top)
             save_significant_json("evader", outer, stamp, top)
 
-        # -------- Optional big-map evaluation after some outers -------- #
+        # -------- Optional big-map evaluation -------- #
         if outer >= schedule.OUTER_SWITCH_BIGMAP:
-            big = EnvConfig(grid_size=40, fov_radius=18)  # larger map & fov
+            big = EnvConfig(grid_size=40, fov_radius=18)
             env_big = TwoAgentTagEnv(big)
             pf_tmp = TorchParticleFilter(hycfg, big.grid_size, big.fov_radius, seed=7, device=device)
             res_ch = rollout_greedy(env_big, "chaser", chaser, evader, pf_tmp, max_steps=1200)
@@ -943,7 +941,7 @@ if __name__ == "__main__":
         env_cfg=EnvConfig(),
         hycfg=HybridConfig(),
         schedule=TrainSchedule(
-            SHOW_EVERY=1000,      # 1k마다 저장
+            SHOW_EVERY=1000,
             PRINT_EVERY=50,
             MAX_STEPS=1000,
             EVAL_EVERY=100,
